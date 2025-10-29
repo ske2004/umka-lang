@@ -334,7 +334,7 @@ static void lexKeywordOrIdent(Lexer *lex)
             return;
         }
     } while (((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
-              (ch >= '0' && ch <= '9') ||  ch == '_'));
+              (ch >= '0' && ch <= '9') ||  ch == '_' || (lex->umxMode && ch == '-')));
 
     lex->tok.name[len] = 0;
     lex->tok.hash = hash(lex->tok.name);
@@ -937,7 +937,7 @@ void lexNext(Lexer *lex)
                 lex->prevTok.kind == TOK_CHARLITERAL ||
                 lex->prevTok.kind == TOK_STRLITERAL)
             {
-               lex->tok.kind = TOK_IMPLICIT_SEMICOLON;
+                lex->tok.kind = TOK_IMPLICIT_SEMICOLON;
             }
 
         lex->prevTok = lex->tok;

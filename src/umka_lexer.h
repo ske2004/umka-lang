@@ -118,7 +118,7 @@ typedef struct
 typedef struct
 {
     char *fileName;
-    bool hasSourceString, trusted;
+    bool hasSourceString, trusted, umxMode;
     char *buf;
     int bufPos, line, pos;
     Token tok, prevTok;

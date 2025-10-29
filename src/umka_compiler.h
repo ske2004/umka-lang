@@ -44,7 +44,9 @@ typedef struct tagUmka
          *fiberType,
          *ptrVoidType, *ptrNullType,
          *anyType,
-         *fileType;
+         *fileType,
+         *umxType,
+         *umxPropType;
 
     // Command-line arguments
     int argc;

@@ -1,3 +1,4 @@
+#include "umka_types.h"
 #define __USE_MINGW_ANSI_STDIO 1
 
 #include <stdlib.h>
@@ -102,6 +103,24 @@ static void compilerDeclareBuiltinTypes(Umka *umka)
     typeAddField(&umka->types, fileDataType, umka->ptrVoidType, "#data");
 
     umka->fileType = typeAddPtrTo(&umka->types, &umka->blocks, fileDataType);
+
+    // umx
+    Type *umxType = typeAdd(&umka->types, &umka->blocks, TYPE_STRUCT);
+
+    Type *umxPropType = typeAdd(&umka->types, &umka->blocks, TYPE_STRUCT);
+    typeAddField(&umka->types, umxPropType, umka->strType, "key");
+    typeAddField(&umka->types, umxPropType, umka->anyType, "value");
+
+    Type *umxChildrenArrayType = typeAdd(&umka->types, &umka->blocks, TYPE_DYNARRAY);
+    umxChildrenArrayType->base = umxType;
+    Type *umxPropArrayType = typeAdd(&umka->types, &umka->blocks, TYPE_DYNARRAY);
+    umxPropArrayType->base = umxPropType;
+    typeAddField(&umka->types, umxType, umka->strType, "tag");
+    typeAddField(&umka->types, umxType, umxChildrenArrayType, "children");
+    typeAddField(&umka->types, umxType, umxPropArrayType, "props");
+
+    umka->umxType = umxType;
+    umka->umxPropType = umxPropType;
 }
 
 
@@ -133,6 +152,7 @@ static void compilerDeclareBuiltinIdents(Umka *umka)
     identAddType(&umka->idents, &umka->modules, &umka->blocks,  "fiber",    umka->fiberType,   true);
     identAddType(&umka->idents, &umka->modules, &umka->blocks,  "any",      umka->anyType,     true);
     identAddType(&umka->idents, &umka->modules, &umka->blocks,  "__file",   umka->fileType,    true);
+    identAddType(&umka->idents, &umka->modules, &umka->blocks,  "umx",      umka->umxType,     true);
 
     // Built-in functions
     // I/O

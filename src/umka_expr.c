@@ -1,3 +1,6 @@
+#include "umka_gen.h"
+#include "umka_lexer.h"
+#include "umka_types.h"
 #define __USE_MINGW_ANSI_STDIO 1
 
 #include <stdio.h>
@@ -2649,6 +2652,117 @@ void parseDesignatorList(Umka *umka, const Type **type, Const *constant, bool *i
     }
 }
 
+static void parseFactor(Umka *umka, const Type **type, Const *constant);
+static void parseUmx(Umka *umka, const Type **type)
+{
+    const Field *tagField = typeFindField(umka->umxType, "tag", NULL);
+    const Field *childrenField = typeFindField(umka->umxType, "children", NULL);
+    const Field *propsField = typeFindField(umka->umxType, "props", NULL);
+    const Field *keyField = typeFindField(umka->umxPropType, "key", NULL);
+    const Field *valueField = typeFindField(umka->umxPropType, "value", NULL);
+
+    const char *name = umka->lex.tok.name;
+    char *str = storageAddStr(&umka->storage, strlen(name));
+    strcpy(str, name);
+
+    const Ident *nodeIdent = identAllocTempVar(&umka->idents, &umka->types, &umka->modules, &umka->blocks, umka->umxType, false);
+    doZeroVar(umka, nodeIdent);
+
+    genPushLocalPtr(&umka->gen, nodeIdent->offset + tagField->offset);
+    genPushGlobalPtr(&umka->gen, str);
+    genAssign(&umka->gen, TYPE_STR, typeSize(&umka->types, umka->strType));
+
+    *type = umka->umxType;
+
+    lexEat(&umka->lex, TOK_IDENT);
+
+    if (umka->lex.tok.kind == TOK_IDENT) {
+        Type *staticArrayType = typeAdd(&umka->types, &umka->blocks, TYPE_ARRAY);
+        staticArrayType->base = umka->umxPropType;
+        int itemSize = typeSize(&umka->types, staticArrayType->base);
+
+        while (umka->lex.tok.kind == TOK_IDENT) {
+            lexEat(&umka->lex, TOK_IDENT);
+            const char *name = umka->lex.tok.name;
+            char *str = storageAddStr(&umka->storage, strlen(name));
+            strcpy(str, name);
+
+            const Ident *paramIdent = identAllocTempVar(&umka->idents, &umka->types, &umka->modules, &umka->blocks, umka->umxPropType, false);
+            doZeroVar(umka, paramIdent);
+
+            genPushLocalPtr(&umka->gen, paramIdent->offset + keyField->offset);
+            genPushGlobalPtr(&umka->gen, str);
+            genAssign(&umka->gen, TYPE_STR, typeSize(&umka->types, umka->strType));
+
+            lexEat(&umka->lex, TOK_EQ);
+            
+            genPushLocalPtr(&umka->gen, paramIdent->offset + valueField->offset);
+            const Type *ptype = NULL;
+            umka->lex.umxMode = false;
+            parseFactor(umka, &ptype, NULL);
+            umka->lex.umxMode = true;
+            doExplicitTypeConv(umka, umka->anyType, &ptype, NULL);
+            genChangeRefCntAssign(&umka->gen, ptype);
+
+            genPushLocalPtr(&umka->gen, paramIdent->offset);
+            typeResizeArray(staticArrayType, staticArrayType->numItems + 1);
+        }
+
+        const int staticArrayOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, staticArrayType);
+        for (int i = staticArrayType->numItems - 1; i >= 0; i--)
+        {
+            genPushLocalPtr(&umka->gen, staticArrayOffset + i * itemSize);
+            genSwapAssign(&umka->gen, staticArrayType->base->kind, staticArrayType->base->size);   
+        }
+
+        genPushLocalPtr(&umka->gen, nodeIdent->offset + propsField->offset);
+        genPushLocalPtr(&umka->gen, staticArrayOffset);
+        doAssertImplicitTypeConv(umka, propsField->type, (const Type **)&staticArrayType, NULL);
+        genChangeRefCntAssign(&umka->gen, staticArrayType);
+    }
+
+    if (umka->lex.tok.kind == TOK_DIV) {
+        lexEat(&umka->lex, TOK_DIV);
+    } else {
+        lexEat(&umka->lex, TOK_GREATER);
+
+        Type *staticArrayType = typeAdd(&umka->types, &umka->blocks, TYPE_ARRAY);
+        staticArrayType->base = umka->umxType;
+        int itemSize = typeSize(&umka->types, staticArrayType->base);
+
+        while (true) {
+            lexEat(&umka->lex, TOK_LESS);
+
+            if (umka->lex.tok.kind == TOK_DIV) {
+                lexEat(&umka->lex, TOK_DIV);
+                if (strcmp(umka->lex.tok.name, str) != 0) {
+                    umka->error.handler(umka->error.context, "XML literal '%s' closed by '%s'", str, umka->lex.tok.name);
+                }
+
+                lexEat(&umka->lex, TOK_IDENT);
+                break;
+            } else {
+                parseUmx(umka, type);
+                lexEat(&umka->lex, TOK_GREATER);
+                typeResizeArray(staticArrayType, staticArrayType->numItems + 1);
+            }
+        }
+
+        const int staticArrayOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, staticArrayType);
+        for (int i = staticArrayType->numItems - 1; i >= 0; i--)
+        {
+            genPushLocalPtr(&umka->gen, staticArrayOffset + i * itemSize);
+            genSwapAssign(&umka->gen, staticArrayType->base->kind, staticArrayType->base->size);
+        }
+
+        genPushLocalPtr(&umka->gen, nodeIdent->offset + childrenField->offset);
+        genPushLocalPtr(&umka->gen, staticArrayOffset);
+        doAssertImplicitTypeConv(umka, childrenField->type, (const Type **)&staticArrayType, NULL);
+        genChangeRefCntAssign(&umka->gen, staticArrayType);
+    }
+
+    genPushLocalPtr(&umka->gen, nodeIdent->offset);
+}
 
 // factor = designator | intNumber | realNumber | charLiteral | stringLiteral |
 //          ("+" | "-" | "!" | "~" ) factor | "&" designator | "(" expr ")".
@@ -2789,6 +2903,21 @@ static void parseFactor(Umka *umka, const Type **type, Const *constant)
             parseExpr(umka, type, constant);
 
             lexEat(&umka->lex, TOK_RPAR);
+            break;
+        }
+        
+        case TOK_LESS:
+        {
+            if (constant)
+                umka->error.handler(umka->error.context, "XML literals are not allowed for constants");
+            
+            lexEat(&umka->lex, TOK_LESS);
+            umka->lex.umxMode = true;
+            parseUmx(umka, type);
+            umka->lex.umxMode = false;
+            if (umka->lex.tok.kind != TOK_GREATER)
+                lexEat(&umka->lex, TOK_GREATER);
+            lexNextForcedSemicolon(&umka->lex);
             break;
         }
 
