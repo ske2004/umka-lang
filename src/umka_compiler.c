@@ -112,7 +112,7 @@ static void compilerDeclareBuiltinTypes(Umka *umka)
     typeAddField(&umka->types, umxPropType, umka->anyType, "value");
 
     Type *umxChildrenArrayType = typeAdd(&umka->types, &umka->blocks, TYPE_DYNARRAY);
-    umxChildrenArrayType->base = umxType;
+    umxChildrenArrayType->base = umka->anyType;
     Type *umxPropArrayType = typeAdd(&umka->types, &umka->blocks, TYPE_DYNARRAY);
     umxPropArrayType->base = umxPropType;
     typeAddField(&umka->types, umxType, umka->strType, "tag");

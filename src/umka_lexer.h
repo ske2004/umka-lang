@@ -93,6 +93,13 @@ typedef enum
 } TokenKind;
 
 
+typedef enum {
+    MODE_NORMAL,
+    MODE_UMX_TAG,
+    MODE_UMX_BODY,
+} LexerMode;
+
+
 typedef char IdentName[MAX_IDENT_LEN + 1];
 
 
@@ -118,13 +125,14 @@ typedef struct
 typedef struct
 {
     char *fileName;
-    bool hasSourceString, trusted, umxMode;
+    bool hasSourceString, trusted;
     char *buf;
     int bufPos, line, pos;
     Token tok, prevTok;
     Storage *storage;
     DebugInfo *debug;
     Error *error;
+    LexerMode mode;
 } Lexer;
 
 

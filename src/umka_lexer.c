@@ -334,18 +334,19 @@ static void lexKeywordOrIdent(Lexer *lex)
             return;
         }
     } while (((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
-              (ch >= '0' && ch <= '9') ||  ch == '_' || (lex->umxMode && ch == '-')));
+              (ch >= '0' && ch <= '9') ||  ch == '_' || (lex->mode == MODE_UMX_TAG && ch == '-')));
 
     lex->tok.name[len] = 0;
     lex->tok.hash = hash(lex->tok.name);
 
     // Search for a keyword
-    for (int i = 0; i < NUM_KEYWORDS; i++)
-        if (lex->tok.hash == keywordHash[i] && strcmp(lex->tok.name, spelling[TOK_BREAK + i]) == 0)
-        {
-            lex->tok.kind = TOK_BREAK + i;
-            break;
-        }
+    if (lex->mode != MODE_UMX_TAG)
+        for (int i = 0; i < NUM_KEYWORDS; i++)
+            if (lex->tok.hash == keywordHash[i] && strcmp(lex->tok.name, spelling[TOK_BREAK + i]) == 0)
+            {
+                lex->tok.kind = TOK_BREAK + i;
+                break;
+            }
 
     if (lex->tok.kind == TOK_NONE)
         lex->tok.kind = TOK_IDENT;
@@ -510,7 +511,7 @@ static void lexOperator(Lexer *lex)
         case '>':
         {
             ch = lexChar(lex);
-            if (ch == '>')
+            if (ch == '>' && lex->mode != MODE_UMX_TAG)
             {
                 ch = lexChar(lex);
                 if (ch == '=')
@@ -882,8 +883,141 @@ static void lexStrLiteral(Lexer *lex)
 }
 
 
+static bool isSpace(char ch)
+{
+    return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\v';
+}
+
+
+static bool escapeSeq(Lexer *lex, int *size, const char *seq, const char *match, char chr)
+{
+    if (strcmp(seq, match) == 0)
+    {
+        if (lex->tok.strVal)
+            lex->tok.strVal[*size] = chr;
+
+        (*size)++;
+
+        return true;
+    }
+
+    return false;
+}
+
+static bool trimSpace(Lexer *lex, char *ch)
+{
+    bool hasSpace = false;
+    while (isSpace(*ch))
+    {
+        hasSpace = true;
+        *ch = lexChar(lex);
+    }
+    return hasSpace;
+}
+
+
+static int lexXmlString(Lexer *lex)
+{
+    lex->tok.kind = TOK_STRLITERAL;
+    int size = 0;
+    char ch = lex->buf[lex->bufPos];
+
+    while (ch != '<' && ch != '{')
+    {
+        if (ch == '&')
+        {
+            char seq[MAX_IDENT_LEN] = { 0 };
+            int i=0;
+
+            ch = lexChar(lex);
+            while (ch != ';')
+            {
+                if (i >= MAX_IDENT_LEN-1)
+                {
+                    lex->error->handler(lex->error->context, "XML escape literal is too long");
+                }
+                seq[i++] = ch;
+                ch = lexChar(lex);
+            }
+
+            if (!(escapeSeq(lex, &size, seq, "amp", '&') ||
+                  escapeSeq(lex, &size, seq, "lt", '<') ||
+                  escapeSeq(lex, &size, seq, "gt", '>') || 
+                  escapeSeq(lex, &size, seq, "lbr", '{') ||
+                  escapeSeq(lex, &size, seq, "rbr", '}') || 
+                  escapeSeq(lex, &size, seq, "nbsp", ' ') ||
+                  escapeSeq(lex, &size, seq, "tab", '\t') ||
+                  escapeSeq(lex, &size, seq, "cr", '\r') ||
+                  escapeSeq(lex, &size, seq, "lf", '\n')))
+            {
+                lex->error->handler(lex->error->context, "Invalid UMX escape literal");
+            }
+        }
+        else
+        {
+            if (lex->tok.strVal)
+                lex->tok.strVal[size] = ch;
+            size++;
+        }
+
+        ch = lexChar(lex);
+
+        if (trimSpace(lex, &ch) && ch != '<' && ch != '{')
+        {
+            if (lex->tok.strVal)
+                lex->tok.strVal[size] = ' ';
+            size++;
+        }
+    }
+
+    if (lex->tok.strVal)
+        lex->tok.strVal[size] = 0;
+    size++;
+
+    return size;
+}
+
+
+static void lexXmlBody(Lexer *lex)
+{
+    char ch = lex->buf[lex->bufPos];
+
+    trimSpace(lex, &ch);
+
+    lex->tok.kind = TOK_NONE;
+    lex->tok.line = lex->debug->line = lex->line;
+    lex->tok.pos = lex->pos;
+
+    if (lex->buf[lex->bufPos] == '<')
+    {
+        lex->tok.kind = TOK_LESS;
+        lexChar(lex);
+        return;
+    }
+    else if (lex->buf[lex->bufPos] == '{')
+    {
+        lex->tok.kind = TOK_LBRACE;
+        lexChar(lex);
+        return;
+    }
+
+    Lexer lookaheadLex = *lex;
+    lookaheadLex.tok.strVal = NULL;
+    const int size = lexXmlString(&lookaheadLex);
+
+    lex->tok.strVal = storageAddStr(lex->storage, size - 1);
+    lexXmlString(lex);
+}
+
+
 static void lexNextWithEOLN(Lexer *lex)
 {
+    if (lex->mode == MODE_UMX_BODY)
+    {
+        lexXmlBody(lex);
+        return;
+    }
+
     lexSpacesAndComments(lex);
 
     lex->tok.kind = TOK_NONE;
