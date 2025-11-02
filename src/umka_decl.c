@@ -946,11 +946,14 @@ void parseProgram(Umka *umka)
     // Entry point
     genEntryPoint(&umka->gen, 0);
 
-    const Ident *mainFn = identFind(&umka->idents, &umka->modules, &umka->blocks, mainModule, "main", NULL, false);
-    if (mainFn && identIsMain(mainFn))
+    const Ident *mainIdent = identFind(&umka->idents, &umka->modules, &umka->blocks, mainModule, "main", NULL, false);
+    if (mainIdent)
     {
+        if (!identIsMain(mainIdent))
+            umka->error.handler(umka->error.context, "Identifier main must be fn main()");
+
         genPushZero(&umka->gen, sizeof(Interface) / sizeof(Slot));  // Dummy upvalue
-        genCall(&umka->gen, mainFn->offset);
+        genCall(&umka->gen, mainIdent->offset);
     }
 
     doGarbageCollection(umka);
