@@ -916,13 +916,45 @@ static bool trimSpace(Lexer *lex, char *ch)
 }
 
 
-static int lexXmlString(Lexer *lex)
+static int trimUmxComment(Lexer *lex, char *ch)
+{
+    bool hasComment = false;
+
+    if (lex->buf[lex->bufPos] == '<' &&
+        lex->buf[lex->bufPos+1] == '!' &&
+        lex->buf[lex->bufPos+2] == '-' &&
+        lex->buf[lex->bufPos+3] == '-')
+    {
+        hasComment = true;
+        while (lex->buf[lex->bufPos] && !(lex->buf[lex->bufPos] == '-' &&
+                 lex->buf[lex->bufPos+1] == '-' &&
+                 lex->buf[lex->bufPos+2] == '>'))
+        {
+            *ch = lexChar(lex);
+        }
+
+        if (!lex->buf[lex->bufPos])
+        {
+            lex->error->handler(lex->error->context, "Unclosed UMX comment");
+        }
+
+        // is there a better way?
+        *ch = lexChar(lex);
+        *ch = lexChar(lex);
+        *ch = lexChar(lex);
+    }
+
+    return hasComment;
+}
+
+
+static int lexUmxString(Lexer *lex)
 {
     lex->tok.kind = TOK_STRLITERAL;
     int size = 0;
     char ch = lex->buf[lex->bufPos];
 
-    while (ch != '<' && ch != '{')
+    while (ch && ch != '<' && ch != '{')
     {
         if (ch == '&')
         {
@@ -930,14 +962,19 @@ static int lexXmlString(Lexer *lex)
             int i=0;
 
             ch = lexChar(lex);
-            while (ch != ';')
+            while (ch && ch != '\n' && ch != ';')
             {
                 if (i >= MAX_IDENT_LEN-1)
                 {
-                    lex->error->handler(lex->error->context, "XML escape literal is too long");
+                    lex->error->handler(lex->error->context, "UMX escape literal is too long");
                 }
                 seq[i++] = ch;
                 ch = lexChar(lex);
+            }
+            
+            if (!ch || ch == '\n')
+            {
+                lex->error->handler(lex->error->context, "Unclosed UMX escape sequence");
             }
 
             if (!(escapeSeq(lex, &size, seq, "amp", '&') ||
@@ -970,6 +1007,11 @@ static int lexXmlString(Lexer *lex)
         }
     }
 
+    if (!ch)
+    {
+        lex->error->handler(lex->error->context, "Unclosed UMX body");
+    }
+
     if (lex->tok.strVal)
         lex->tok.strVal[size] = 0;
     size++;
@@ -978,11 +1020,12 @@ static int lexXmlString(Lexer *lex)
 }
 
 
-static void lexXmlBody(Lexer *lex)
+static void lexUmxBody(Lexer *lex)
 {
     char ch = lex->buf[lex->bufPos];
 
-    trimSpace(lex, &ch);
+    while (trimSpace(lex, &ch) || trimUmxComment(lex, &ch))
+        ;
 
     lex->tok.kind = TOK_NONE;
     lex->tok.line = lex->debug->line = lex->line;
@@ -1003,10 +1046,10 @@ static void lexXmlBody(Lexer *lex)
 
     Lexer lookaheadLex = *lex;
     lookaheadLex.tok.strVal = NULL;
-    const int size = lexXmlString(&lookaheadLex);
+    const int size = lexUmxString(&lookaheadLex);
 
     lex->tok.strVal = storageAddStr(lex->storage, size - 1);
-    lexXmlString(lex);
+    lexUmxString(lex);
 }
 
 
@@ -1014,7 +1057,7 @@ static void lexNextWithEOLN(Lexer *lex)
 {
     if (lex->mode == MODE_UMX_BODY)
     {
-        lexXmlBody(lex);
+        lexUmxBody(lex);
         return;
     }
 

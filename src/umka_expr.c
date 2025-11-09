@@ -2763,7 +2763,7 @@ static void parseUmx(Umka *umka, const Type **type)
                         lexEat(&umka->lex, TOK_DIV);
                         if (strcmp(umka->lex.tok.name, tagName) != 0)
                         {
-                            umka->error.handler(umka->error.context, "XML literal '%s' closed by '%s'", tagName, umka->lex.tok.name);
+                            umka->error.handler(umka->error.context, "UMX literal '%s' closed by '%s'", tagName, umka->lex.tok.name);
                         }
 
                         lexEat(&umka->lex, TOK_IDENT);
@@ -2956,7 +2956,7 @@ static void parseFactor(Umka *umka, const Type **type, Const *constant)
         case TOK_LESS:
         {
             if (constant)
-                umka->error.handler(umka->error.context, "XML literals are not allowed for constants");
+                umka->error.handler(umka->error.context, "UMX literals are not allowed for constants");
             
             umka->lex.mode = MODE_UMX_TAG;
             lexEat(&umka->lex, TOK_LESS);
