@@ -48,10 +48,9 @@ typedef struct tagUmka
          *umxType,
          *umxPropType;
 
-    // Command-line arguments
-    int argc;
-    char **argv;
-
+    // main() context
+    UmkaFuncContext mainFn;
+    
     // Arbitrary metadata
     void *metadata;
 

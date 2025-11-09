@@ -199,14 +199,14 @@ static void doStrToDynArrayConv(Umka *umka, const Type *dest, const Type **src, 
 {
     if (constant)
     {
-        int len = getStrDims((char *)constant->ptrVal)->len;
+        const int len = getStrDims((char *)constant->ptrVal)->len;
         DynArray *array = storageAddDynArray(&umka->storage, dest, len);
         memcpy(array->data, constant->ptrVal, len);
         constant->ptrVal = array;
     }
     else
     {
-        int resultOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, dest);
+        const int resultOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, dest);
         genPushLocalPtr(&umka->gen, resultOffset);                          // Pointer to result (hidden parameter)
         genCallTypedBuiltin(&umka->gen, dest, BUILTIN_MAKEFROMSTR);
         doCopyResultToTempVar(umka, dest);
@@ -224,7 +224,7 @@ static void doDynArrayToArrayConv(Umka *umka, const Type *dest, const Type **src
     if (lhs)
         genSwap(&umka->gen);
 
-    int resultOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, dest);
+    const int resultOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, dest);
     genPushLocalPtr(&umka->gen, resultOffset);                          // Pointer to result (hidden parameter)
     genCallTypedBuiltin(&umka->gen, dest, BUILTIN_MAKETOARR);
     doCopyResultToTempVar(umka, dest);
@@ -246,7 +246,7 @@ static void doArrayToDynArrayConv(Umka *umka, const Type *dest, const Type **src
     }
     else
     {
-        int resultOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, dest);
+        const int resultOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, dest);
 
         genPushIntConst(&umka->gen, (*src)->numItems);                      // Dynamic array length
         genPushLocalPtr(&umka->gen, resultOffset);                          // Pointer to result (hidden parameter)
@@ -264,7 +264,7 @@ static void doDynArrayToDynArrayConv(Umka *umka, const Type *dest, const Type **
         umka->error.handler(umka->error.context, "Conversion from dynamic array is not allowed in constant expressions");
 
     // Get source array length: length = len(srcArray)
-    int lenOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, umka->intType);
+    const int lenOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, umka->intType);
 
     genDup(&umka->gen);
     genCallBuiltin(&umka->gen, (*src)->kind, BUILTIN_LEN);
@@ -281,7 +281,7 @@ static void doDynArrayToDynArrayConv(Umka *umka, const Type *dest, const Type **
     genPop(&umka->gen);
 
     // Loop initialization: index = length - 1
-    int indexOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, umka->intType);
+    const int indexOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, umka->intType);
 
     genPushLocal(&umka->gen, TYPE_INT, lenOffset);
     genPushIntConst(&umka->gen, 1);
@@ -353,7 +353,7 @@ static void doPtrToInterfaceConv(Umka *umka, const Type *dest, const Type **src,
     }
     else
     {
-        int destOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, dest);
+        const int destOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, dest);
 
         // Assign to #self
         genPushLocalPtr(&umka->gen, destOffset);                                // Push dest.#self pointer
@@ -410,7 +410,7 @@ static void doInterfaceToInterfaceConv(Umka *umka, const Type *dest, const Type 
     if (constant)
         umka->error.handler(umka->error.context, "Conversion to interface is not allowed in constant expressions");
 
-    int destOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, dest);
+    const int destOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, dest);
 
     // Assign to #self
     genDup(&umka->gen);                                                     // Duplicate src pointer
@@ -523,7 +523,7 @@ static void doFnToClosureConv(Umka *umka, const Type *dest, const Type **src, Co
     if (constant)
         umka->error.handler(umka->error.context, "Conversion to closure is not allowed in constant expressions");
 
-    int destOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, dest);
+    const int destOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, dest);
 
     genPushLocalPtr(&umka->gen, destOffset);
     genZero(&umka->gen, typeSize(&umka->types, dest));
@@ -627,7 +627,7 @@ static void doImplicitTypeConvEx(Umka *umka, const Type *dest, const Type **src,
 
             doPtrToInterfaceConv(umka, dest, src, constant);
         }
-        else if ((*src)->kind != TYPE_VOID)
+        else if ((*src)->kind != TYPE_VOID && !(*src)->isExprList)
         {
             // Value to interface
             doValueToInterfaceConv(umka, dest, src, constant);
@@ -998,13 +998,13 @@ static void parseBuiltinMakeCall(Umka *umka, const Type **type, Const *constant)
         typeAssertCompatible(&umka->types, umka->intType, lenType);
 
         // Pointer to result (hidden parameter)
-        int resultOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, *type);
+        const int resultOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, *type);
         genPushLocalPtr(&umka->gen, resultOffset);
     }
     else if ((*type)->kind == TYPE_MAP)
     {
         // Pointer to result (hidden parameter)
-        int resultOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, *type);
+        const int resultOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, *type);
         genPushLocalPtr(&umka->gen, resultOffset);
     }
     else if ((*type)->kind == TYPE_FIBER)
@@ -1036,7 +1036,7 @@ static void parseBuiltinCopyCall(Umka *umka, const Type **type, Const *constant)
     typeAssertCompatibleBuiltin(&umka->types, *type, BUILTIN_COPY, (*type)->kind == TYPE_DYNARRAY || (*type)->kind == TYPE_MAP);
 
     // Pointer to result (hidden parameter)
-    int resultOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, *type);
+    const int resultOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, *type);
     genPushLocalPtr(&umka->gen, resultOffset);
 
     genCallTypedBuiltin(&umka->gen, *type, BUILTIN_COPY);
@@ -1076,7 +1076,7 @@ static void parseBuiltinAppendCall(Umka *umka, const Type **type, Const *constan
         if (!typeStructured(itemType))
         {
             // Assignment to an anonymous stack area does not require updating reference counts
-            int itemOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, itemType);
+            const int itemOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, itemType);
             genPushLocalPtr(&umka->gen, itemOffset);
             genSwapAssign(&umka->gen, itemType->kind, 0);
 
@@ -1088,7 +1088,7 @@ static void parseBuiltinAppendCall(Umka *umka, const Type **type, Const *constan
     genPushIntConst(&umka->gen, singleItem);
 
     // Pointer to result (hidden parameter)
-    int resultOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, *type);
+    const int resultOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, *type);
     genPushLocalPtr(&umka->gen, resultOffset);
 
     genCallTypedBuiltin(&umka->gen, *type, BUILTIN_APPEND);
@@ -1123,7 +1123,7 @@ static void parseBuiltinInsertCall(Umka *umka, const Type **type, Const *constan
     if (!typeStructured(itemType))
     {
         // Assignment to an anonymous stack area does not require updating reference counts
-        int itemOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, itemType);
+        const int itemOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, itemType);
         genPushLocalPtr(&umka->gen, itemOffset);
         genSwapAssign(&umka->gen, itemType->kind, 0);
 
@@ -1131,7 +1131,7 @@ static void parseBuiltinInsertCall(Umka *umka, const Type **type, Const *constan
     }
 
     // Pointer to result (hidden parameter)
-    int resultOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, *type);
+    const int resultOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, *type);
     genPushLocalPtr(&umka->gen, resultOffset);
 
     genCallTypedBuiltin(&umka->gen, *type, BUILTIN_INSERT);
@@ -1160,7 +1160,7 @@ static void parseBuiltinDeleteCall(Umka *umka, const Type **type, Const *constan
     doAssertImplicitTypeConv(umka, expectedIndexType, &indexType, NULL);
 
     // Pointer to result (hidden parameter)
-    int resultOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, *type);
+    const int resultOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, *type);
     genPushLocalPtr(&umka->gen, resultOffset);
 
     genCallTypedBuiltin(&umka->gen, *type, BUILTIN_DELETE);
@@ -1199,7 +1199,7 @@ static void parseBuiltinSliceCall(Umka *umka, const Type **type, Const *constant
     if ((*type)->kind == TYPE_DYNARRAY)
     {
         // Pointer to result (hidden parameter)
-        int resultOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, *type);
+        const int resultOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, *type);
         genPushLocalPtr(&umka->gen, resultOffset);
     }
     else
@@ -1525,7 +1525,7 @@ static void parseBuiltinKeysCall(Umka *umka, const Type **type, Const *constant)
     keysType->base = typeMapKey(*type);
 
     // Pointer to result (hidden parameter)
-    int resultOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, keysType);
+    const int resultOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, keysType);
     genPushLocalPtr(&umka->gen, resultOffset);
 
     genCallTypedBuiltin(&umka->gen, keysType, BUILTIN_KEYS);
@@ -1785,8 +1785,12 @@ static void parseCall(Umka *umka, const Type **type)
     // Push #result pointer
     if (typeStructured((*type)->sig.resultType))
     {
-        int offset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, (*type)->sig.resultType);
-        genPushLocalPtr(&umka->gen, offset);
+        const int resultOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, (*type)->sig.resultType);
+        
+        genPushLocalPtr(&umka->gen, resultOffset);
+        genZero(&umka->gen, typeSize(&umka->types, (*type)->sig.resultType));
+
+        genPushLocalPtr(&umka->gen, resultOffset);
         i++;
     }
 

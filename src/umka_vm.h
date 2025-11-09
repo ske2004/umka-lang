@@ -1,6 +1,7 @@
 #ifndef UMKA_VM_H_INCLUDED
 #define UMKA_VM_H_INCLUDED
 
+#include "umka_api.h"
 #include "umka_common.h"
 #include "umka_lexer.h"
 #include "umka_types.h"
@@ -24,6 +25,12 @@ enum    // Memory manager settings
     MEM_MIN_FREE_HEAP  = 1024,                   // Bytes
     MEM_MIN_HEAP_CHUNK = 64,                     // Bytes
     MEM_MIN_HEAP_PAGE  = 1024 * 1024,            // Bytes
+};
+
+
+enum
+{
+    JUMP_TO_CLEANUP = 0
 };
 
 
@@ -194,7 +201,8 @@ typedef struct tagVM
 void vmInit                     (VM *vm, Storage *storage, int stackSize, bool fileSystemEnabled, Error *error);
 void vmFree                     (VM *vm);
 void vmReset                    (VM *vm, const Instruction *code, const DebugInfo *debugPerInstr);
-void vmRun                      (VM *vm, UmkaFuncContext *fn);
+void vmCall                     (VM *vm, UmkaFuncContext *fn);
+void vmCleanup                  (VM *vm);
 bool vmAlive                    (VM *vm);
 void vmKill                     (VM *vm);
 int vmAsm                       (int ip, const Instruction *code, const DebugInfo *debugPerInstr, char *buf, int size);
@@ -209,5 +217,11 @@ void vmMakeDynArray             (VM *vm, DynArray *array, const Type *type, int 
 void *vmMakeStruct              (VM *vm, const Type *type);
 int64_t vmGetMemUsage           (VM *vm);
 const char *vmBuiltinSpelling   (BuiltinFunc builtin);
+
+
+static inline const ParamLayout **vmGetParamLayout(UmkaStackSlot *params)
+{
+    return (const ParamLayout **)&params[-4].ptrVal;     // For -4, see the stack layout diagram in umka_vm.c
+}
 
 #endif // UMKA_VM_H_INCLUDED

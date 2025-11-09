@@ -51,6 +51,8 @@ static void compilerSetAPI(Umka *umka)
     umka->api.umkaSetMetadata       = umkaSetMetadata;
     umka->api.umkaMakeStruct        = umkaMakeStruct;
     umka->api.umkaGetBaseType       = umkaGetBaseType;
+    umka->api.umkaGetParamType      = umkaGetParamType;
+    umka->api.umkaGetResultType     = umkaGetResultType;    
 }
 
 
@@ -194,7 +196,7 @@ static void compilerDeclareBuiltinIdents(Umka *umka)
     identAddBuiltinFunc(&umka->idents, &umka->modules, &umka->blocks, "selfptr",    umka->ptrVoidType, BUILTIN_SELFPTR);
     identAddBuiltinFunc(&umka->idents, &umka->modules, &umka->blocks, "selfhasptr", umka->boolType,    BUILTIN_SELFHASPTR);
     identAddBuiltinFunc(&umka->idents, &umka->modules, &umka->blocks, "selftypeeq", umka->boolType,    BUILTIN_SELFTYPEEQ);
-    identAddBuiltinFunc(&umka->idents, &umka->modules, &umka->blocks, "typeptr",    umka->ptrVoidType, BUILTIN_TYPEPTR);
+    identAddBuiltinFunc(&umka->idents, &umka->modules, &umka->blocks, "typeptr",    umka->ptrVoidType, BUILTIN_TYPEPTR);        // Deprecated
     identAddBuiltinFunc(&umka->idents, &umka->modules, &umka->blocks, "valid",      umka->boolType,    BUILTIN_VALID);
 
     // Maps
@@ -236,14 +238,29 @@ static void compilerDeclareExternalFuncs(Umka *umka, bool fileSystemEnabled)
 }
 
 
-void compilerInit(Umka *umka, const char *fileName, const char *sourceString, int stackSize, int argc, char **argv, bool fileSystemEnabled, bool implLibsEnabled)
+static void compilerSetCodepage(Umka *umka)
 {
 #ifdef _WIN32
     umka->originalInputCodepage = GetConsoleCP();
     umka->originalOutputCodepage = GetConsoleOutputCP();
     SetConsoleCP(CP_UTF8);
     SetConsoleOutputCP(CP_UTF8);
-#endif
+#endif    
+}
+
+
+static void compilerRestoreCodepage(Umka *umka)
+{
+#ifdef _WIN32
+    SetConsoleCP(umka->originalInputCodepage);
+    SetConsoleOutputCP(umka->originalOutputCodepage);
+#endif  
+}
+
+
+void compilerInit(Umka *umka, const char *fileName, const char *sourceString, int stackSize, int argc, char **argv, bool fileSystemEnabled, bool implLibsEnabled)
+{
+    compilerSetCodepage(umka);
 
     compilerSetAPI(umka);
 
@@ -266,13 +283,10 @@ void compilerInit(Umka *umka, const char *fileName, const char *sourceString, in
 
     char filePath[DEFAULT_STR_LEN + 1] = "";
     moduleAssertRegularizePath(&umka->modules, fileName, umka->modules.curFolder, filePath, DEFAULT_STR_LEN + 1);
-
+    
     umka->lex.fileName = filePath;
 
     lexInit(&umka->lex, &umka->storage, &umka->debug, filePath, sourceString, false, &umka->error);
-
-    umka->argc  = argc;
-    umka->argv  = argv;
 
     umka->blocks.module = moduleAdd(&umka->modules, "#universe");
 
@@ -283,15 +297,15 @@ void compilerInit(Umka *umka, const char *fileName, const char *sourceString, in
     // Command-line-arguments
     Type *argvType = typeAdd(&umka->types, &umka->blocks, TYPE_ARRAY);
     argvType->base = umka->strType;
-    typeResizeArray(argvType, umka->argc);
+    typeResizeArray(argvType, argc);
 
     Ident *rtlargv = identAllocVar(&umka->idents, &umka->types, &umka->modules, &umka->blocks, "rtlargv", argvType, true);
     char **argArray = (char **)rtlargv->ptr;
 
-    for (int i = 0; i < umka->argc; i++)
+    for (int i = 0; i < argc; i++)
     {
-        argArray[i] = storageAddStr(&umka->storage, strlen(umka->argv[i]));
-        strcpy(argArray[i], umka->argv[i]);
+        argArray[i] = storageAddStr(&umka->storage, strlen(argv[i]));
+        strcpy(argArray[i], argv[i]);
     }
 
     // Embedded standard library modules
@@ -309,14 +323,14 @@ void compilerInit(Umka *umka, const char *fileName, const char *sourceString, in
 
 void compilerFree(Umka *umka)
 {
-    vmFree          (&umka->vm);
-    moduleFree      (&umka->modules);
-    storageFree     (&umka->storage);
+    if (vmAlive(&umka->vm))
+        vmCleanup(&umka->vm);
+    
+    vmFree      (&umka->vm);
+    moduleFree  (&umka->modules);
+    storageFree (&umka->storage);
 
-#ifdef _WIN32
-    SetConsoleCP(umka->originalInputCodepage);
-    SetConsoleOutputCP(umka->originalOutputCodepage);
-#endif
+    compilerRestoreCodepage(umka);
 }
 
 
@@ -329,13 +343,14 @@ void compilerCompile(Umka *umka)
 
 void compilerRun(Umka *umka)
 {
-    vmRun(&umka->vm, NULL);
+    if (umka->mainFn.entryOffset > 0)
+        vmCall(&umka->vm, &umka->mainFn);
 }
 
 
 void compilerCall(Umka *umka, UmkaFuncContext *fn)
 {
-    vmRun(&umka->vm, fn);
+    vmCall(&umka->vm, fn);
 }
 
 
@@ -390,7 +405,6 @@ bool compilerGetFunc(Umka *umka, const char *moduleName, const char *funcName, U
         return false;
 
     identSetUsed(fnIdent);
-
     compilerMakeFuncContext(umka, fnIdent->type, fnIdent->offset, fn);
     return true;
 }
@@ -404,7 +418,7 @@ void compilerMakeFuncContext(Umka *umka, const Type *fnType, int entryOffset, Um
     fn->params = (UmkaStackSlot *)storageAdd(&umka->storage, (paramSlots + 4) * sizeof(Slot)) + 4;          // + 4 slots for compatibility with umkaGetParam()
 
     const ParamLayout *paramLayout = typeMakeParamLayout(&umka->types, &fnType->sig);
-    fn->params[-4].ptrVal = (ParamLayout *)paramLayout;
+    *vmGetParamLayout(fn->params) = paramLayout;
 
     fn->result = storageAdd(&umka->storage, sizeof(Slot));
 }
