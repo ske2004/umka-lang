@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdarg.h>
 #include <setjmp.h>
 
@@ -13,7 +14,7 @@ enum
 {
     DEFAULT_STR_LEN     = 255,
     MAX_IDENT_LEN       = DEFAULT_STR_LEN,
-    MAX_IDENTS_IN_LIST  = 256,
+    MAX_IDENTS_IN_LIST  = 16,
     MAX_MODULES         = 1024,
     MAX_PARAMS          = 16,
     MAX_BLOCK_NESTING   = 100,
@@ -61,6 +62,12 @@ typedef struct tagMapNode               // The C equivalent of the Umka map base
 typedef UmkaMap Map;                    // The C equivalent of the Umka map type. Must have 8 byte alignment
 
 
+typedef struct                          // The C equivalent of the Umka file type
+{
+    FILE *stream;
+} File;
+
+
 typedef struct
 {
     const char *fileName;
@@ -100,7 +107,6 @@ typedef struct
 typedef struct
 {
     char path[DEFAULT_STR_LEN + 1], folder[DEFAULT_STR_LEN + 1], name[DEFAULT_STR_LEN + 1];
-    unsigned int pathHash;
     void *implLib;
     char *importAlias[MAX_MODULES];
     bool isCompiled;
@@ -109,8 +115,7 @@ typedef struct
 
 typedef struct
 {
-    char path[DEFAULT_STR_LEN + 1], folder[DEFAULT_STR_LEN + 1], name[DEFAULT_STR_LEN + 1];
-    unsigned int pathHash;
+    char path[DEFAULT_STR_LEN + 1];
     char *source;
     bool trusted;
 } ModuleSource;
@@ -150,8 +155,8 @@ typedef struct
 typedef struct tagExternal
 {
     char name[DEFAULT_STR_LEN + 1];
-    unsigned int hash;
     void *entry;
+    void *upvalue;
     bool resolved, resolveInTrusted;
     struct tagExternal *next;
 } External;
@@ -162,6 +167,9 @@ typedef struct
     External *first;
     Storage *storage;
 } Externals;
+
+
+typedef struct tagStackFrameLayout StackFrameLayout;   // Actually contains ParamLayout, ParamTypes, LocalVarLayout appended to each other
 
 
 typedef struct
@@ -177,18 +185,42 @@ typedef struct      // Appended to the end of ParamLayout
 {
     const struct tagType *resultType;
     const struct tagType *paramType[];
-} ParamLayoutTypes;
+} ParamTypes;
 
 
-typedef struct
+typedef struct      // Appended to the end of ParamTypes 
 {
-    const ParamLayout *paramLayout;
     int64_t localVarSlots;
-} ParamAndLocalVarLayout;
+} LocalVarLayout;
 
 
-#define PARAM_LAYOUT_SIZE(numParams) (sizeof(ParamLayout) + (numParams) * sizeof(int64_t) + sizeof(ParamLayoutTypes) + (numParams) * sizeof(struct tagType *))
-#define PARAM_LAYOUT_TYPES(layout)   ((ParamLayoutTypes *)((char *)(layout) + sizeof(ParamLayout) + (layout)->numParams * sizeof(int64_t)))
+#define STACK_FRAME_LAYOUT_SIZE(numParams) \
+( \
+    sizeof(ParamLayout) + (numParams) * sizeof(int64_t) + \
+    sizeof(ParamTypes)  + (numParams) * sizeof(struct tagType *) + \
+    sizeof(LocalVarLayout) \
+)
+
+
+static inline const ParamLayout *getParamLayout(const StackFrameLayout *layout)
+{
+    return (ParamLayout *)layout;
+}
+
+
+static inline const ParamTypes *getParamTypes(const StackFrameLayout *layout)
+{
+    const ParamLayout *paramLayout = getParamLayout(layout);
+    return (const ParamTypes *)(paramLayout->firstSlotIndex + paramLayout->numParams);
+}
+
+
+static inline const LocalVarLayout *getLocalVarLayout(const StackFrameLayout *layout)
+{
+    const ParamLayout *paramLayout = getParamLayout(layout);
+    const ParamTypes *paramTypes = getParamTypes(layout);
+    return (const LocalVarLayout *)(paramTypes->paramType + paramLayout->numParams);
+}
 
 
 void errorReportInit(UmkaError *report, Storage *storage, const char *fileName, const char *fnName, int line, int pos, int code, const char *format, va_list args);
@@ -224,25 +256,18 @@ int  blocksCurrent(const Blocks *blocks);
 
 void externalInit       (Externals *externals, Storage *storage);
 External *externalFind  (const Externals *externals, const char *name);
-External *externalAdd   (Externals *externals, const char *name, void *entry, bool resolveInTrusted);
-
-
-static inline unsigned int hash(const char *str)
-{
-    // djb2 hash
-    unsigned int hash = 5381;
-    char ch;
-
-    while ((ch = *str++))
-        hash = ((hash << 5) + hash) + ch;
-
-    return hash;
-}
+External *externalAdd   (Externals *externals, const char *name, void *entry, void *upvalue, bool resolveInTrusted);
 
 
 static inline int64_t nonneg(int64_t size)
 {
     return (size > 0) ? size : 0;
+}
+
+
+static inline char *nonnull(char *buf, int64_t offset)
+{
+    return buf ? buf + offset : NULL;
 }
 
 

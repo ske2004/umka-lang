@@ -21,10 +21,11 @@ typedef enum
 
 enum    // Memory manager settings
 {
-    MEM_MIN_FREE_STACK = 1024,                   // Slots
-    MEM_MIN_FREE_HEAP  = 1024,                   // Bytes
-    MEM_MIN_HEAP_CHUNK = 64,                     // Bytes
-    MEM_MIN_HEAP_PAGE  = 1024 * 1024,            // Bytes
+    MEM_MIN_FREE_STACK    = 1024,                   // Slots
+    MEM_MIN_FREE_HEAP     = 1024,                   // Bytes
+    MEM_MIN_HEAP_CHUNK    = 64,                     // Bytes
+    MEM_MIN_HEAP_PAGE     = 1024 * 1024,            // Bytes
+    MEM_MAX_BLACKLISTED   = 16 * 1024 * 1024        // Bytes   
 };
 
 
@@ -51,6 +52,7 @@ typedef enum
 {
     OP_NOP,
     OP_PUSH,
+    OP_PUSH_GLOBAL,
     OP_PUSH_ZERO,
     OP_PUSH_LOCAL_PTR,
     OP_PUSH_LOCAL_PTR_ZERO,
@@ -64,17 +66,23 @@ typedef enum
     OP_ZERO,
     OP_DEREF,
     OP_ASSIGN,
+    OP_SWAP_ASSIGN,
     OP_ASSIGN_PARAM,
-    OP_CHANGE_REF_CNT,
-    OP_CHANGE_REF_CNT_GLOBAL,
-    OP_CHANGE_REF_CNT_LOCAL,
-    OP_CHANGE_REF_CNT_ASSIGN,
+    OP_REF_CNT,
+    OP_REF_CNT_GLOBAL,
+    OP_REF_CNT_LOCAL,
+    OP_REF_CNT_ASSIGN,
+    OP_SWAP_REF_CNT_ASSIGN,
     OP_UNARY,
     OP_BINARY,
     OP_GET_ARRAY_PTR,
+    OP_GET_ARRAY,
     OP_GET_DYNARRAY_PTR,
+    OP_GET_DYNARRAY,
     OP_GET_MAP_PTR,
+    OP_GET_MAP,
     OP_GET_FIELD_PTR,
+    OP_GET_FIELD,
     OP_ASSERT_TYPE,
     OP_ASSERT_RANGE,
     OP_WEAKEN_PTR,
@@ -109,12 +117,27 @@ typedef union               // Extended version of UmkaStackSlot
 typedef struct
 {
     Opcode opcode;
-    Opcode inlineOpcode;         // Inlined instruction (DEREF, SWAP): PUSH + DEREF, SWAP + ASSIGN etc.
-    TokenKind tokKind;           // Unary/binary operation token
+    TokenKind tokKind;
     TypeKind typeKind;
     const Type *type;
     Slot operand;
 } Instruction;
+
+
+typedef struct
+{
+    void *ptr;
+    const Type *type;
+    struct tagHeapPage *pageForDeferred;   // Mandatory for deferred ref count updates, NULL otherwise
+} RefCntCandidate;
+
+
+typedef struct
+{
+    RefCntCandidate *stack;
+    int top, capacity;
+    Storage *storage;
+} RefCntCandidates;
 
 
 typedef struct tagHeapPage
@@ -130,12 +153,13 @@ typedef struct tagHeapPage
 
 typedef struct
 {
-    HeapPage *first;
-    HeapPage *lastAccessed;
+    HeapPage *first, *firstRecycled, *firstBlacklisted, *lastAccessed;
     char *lowest, *highest;
     int freeId;
-    int64_t totalSize;
+    int64_t totalSize, blacklistedSize;
     struct tagFiber *fiber;
+    int64_t leakSanLevel;
+    RefCntCandidates refCntCandidates;
     Error *error;
 } HeapPages;
 
@@ -153,22 +177,6 @@ typedef struct
 } HeapChunk;
 
 
-typedef struct
-{
-    void *ptr;
-    const Type *type;
-    HeapPage *pageForDeferred;   // Mandatory for deferred ref count updates, NULL otherwise
-} RefCntChangeCandidate;
-
-
-typedef struct
-{
-    RefCntChangeCandidate *stack;
-    int top, capacity;
-    Storage *storage;
-} RefCntChangeCandidates;
-
-
 typedef struct tagFiber
 {
     // Must have 8 byte alignment
@@ -179,7 +187,6 @@ typedef struct tagFiber
     Slot reg[NUM_REGS];
     struct tagFiber *parent;
     const DebugInfo *debugPerInstr;
-    RefCntChangeCandidates *refCntChangeCandidates;
     struct tagVM *vm;
     bool alive;
     bool fileSystemEnabled;
@@ -190,12 +197,14 @@ typedef struct tagVM
 {
     Fiber *fiber, *mainFiber;
     HeapPages pages;
-    RefCntChangeCandidates refCntChangeCandidates;
     UmkaHookFunc hooks[UMKA_NUM_HOOKS];
     bool terminatedNormally;
     Storage *storage;
     Error *error;
 } VM;
+
+
+typedef struct tagIdents Idents;
 
 
 void vmInit                     (VM *vm, Storage *storage, int stackSize, bool fileSystemEnabled, Error *error);
@@ -205,8 +214,8 @@ void vmCall                     (VM *vm, UmkaFuncContext *fn);
 void vmCleanup                  (VM *vm);
 bool vmAlive                    (VM *vm);
 void vmKill                     (VM *vm);
-int vmAsm                       (int ip, const Instruction *code, const DebugInfo *debugPerInstr, char *buf, int size);
-bool vmUnwindCallStack          (VM *vm, Slot **base, int *ip);
+int vmAsm                       (int ip, const Instruction *code, const DebugInfo *debugPerInstr, const Idents *idents, char *buf, int size);
+bool vmUnwindCallStack          (VM *vm, const Slot **base, int *ip);
 void vmSetHook                  (VM *vm, UmkaHookEvent event, UmkaHookFunc hook);
 void *vmAllocData               (VM *vm, int size, UmkaExternFunc onFree);
 void vmIncRef                   (VM *vm, void *ptr, const Type *type);
@@ -219,9 +228,9 @@ int64_t vmGetMemUsage           (VM *vm);
 const char *vmBuiltinSpelling   (BuiltinFunc builtin);
 
 
-static inline const ParamLayout **vmGetParamLayout(UmkaStackSlot *params)
+static inline const StackFrameLayout **vmGetStackFrameLayout(UmkaStackSlot *params)
 {
-    return (const ParamLayout **)&params[-4].ptrVal;     // For -4, see the stack layout diagram in umka_vm.c
+    return (const StackFrameLayout **)&params[-4].ptrVal;     // For -4, see the stack layout diagram in umka_vm.c
 }
 
 #endif // UMKA_VM_H_INCLUDED

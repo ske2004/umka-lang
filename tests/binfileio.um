@@ -4,7 +4,6 @@ fn write(name, s: str) {
 	f, err := std::fopen(name, "wb")
 	std::exitif(err)
 	std::fwrite(f, &[]char(s))
-	std::fclose(f)	
 } 
 
 fn read(name: str): str {
@@ -12,16 +11,24 @@ fn read(name: str): str {
 	std::exitif(err)
 	data, err := std::freadall(f)
 	std::exitif(err)
-	std::fclose(f)
-
 	return str(data)
 }
 
-fn test*() {
+fn test1() {
 	name := "fio.txt"
 	write(name, "Hello World")
 	printf(read(name) + '\n')
-	std::remove(name)
+	std::remove(name)	
+}
+
+fn test2() {
+	f, err := std::fopen("galjkgaklgjkajg", "jgksjgksjgksjg")
+	std::assert(f == null)
+}
+
+fn test*() {
+	test1()
+	test2()
 }
 
 fn main() {

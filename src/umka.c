@@ -18,7 +18,7 @@ enum
 void help(void)
 {
     printf("%s\n", umkaGetVersion());
-    printf("(C) Vasiliy Tereshkov, 2020-2025\n");
+    printf("(C) Vasiliy Tereshkov, 2020-2026\n");
     printf("Usage: umka [<parameters>] <file.um> [<script-parameters>]\n");
     printf("Parameters:\n");
     printf("    -stack <stack-size>     - Set stack size\n");
@@ -83,7 +83,7 @@ void printRuntimeError(Umka *umka)
     if (error->msg[0])
     {
         fprintf(stderr, "\nRuntime error %s (%d): %s\n", error->fileName, error->line, error->msg);
-        fprintf(stderr, "Stack trace:\n");
+        fprintf(stderr, "Terminated at:\n");
 
         for (int depth = 0; depth < MAX_CALL_STACK_DEPTH; depth++)
         {

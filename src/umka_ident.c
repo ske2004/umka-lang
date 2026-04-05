@@ -7,6 +7,9 @@
 #include "umka_ident.h"
 
 
+static bool identIsGarbageCollected(const Blocks *blocks, const Ident *ident);
+
+
 static void identTempName(Idents *idents, char *buf)
 {
     snprintf(buf, DEFAULT_STR_LEN + 1, "#temp%d", idents->tempVarNameSuffix++);
@@ -28,9 +31,11 @@ void identFree(Idents *idents, int block)
 {
     while (idents->first && idents->first->block == block)
     {
+        identWarnIfUnused(idents, idents->first);
+        
         Ident *next = idents->first->next;
 
-        if (idents->first->globallyAllocated)
+        if (idents->first->isGloballyAllocated)
             storageRemove(idents->storage, idents->first->ptr);
 
         storageRemove(idents->storage, idents->first);
@@ -39,34 +44,51 @@ void identFree(Idents *idents, int block)
 }
 
 
+void identMoveBefore(Idents *idents, const Ident *next)
+{
+    for (Ident *ident = idents->first; ident; ident = ident->next)
+    {
+        if (ident->next == next)
+        {
+            Ident *moved = idents->first;
+            if (moved != ident)
+            {
+                idents->first = moved->next;
+                moved->next = ident->next;
+                ident->next = moved;                
+            }
+            return;
+        }
+    }
+}
+
+
 static const Ident *identFindEx(const Idents *idents, const Modules *modules, const Blocks *blocks, int module, const char *name, const Type *rcvType, bool markAsUsed, bool isModule)
 {
-    const unsigned int nameHash = hash(name);
-
-    for (int i = blocks->top; i >= 0; i--)
+    // Identifiers are always sorted by block scope, deepest (current) block first
+    for (const Ident *ident = idents->first; ident; ident = ident->next)
     {
-        for (const Ident *ident = idents->first; ident; ident = ident->next)
-            if (ident->hash == nameHash && strcmp(ident->name, name) == 0 && ident->block == blocks->item[i].block && (ident->kind == IDENT_MODULE) == isModule)
+        if ((ident->kind == IDENT_MODULE) == isModule && strcmp(ident->name, name) == 0)
+        {
+            // What we found has correct name and block scope, check module scope
+            const bool identModuleValid = (ident->module == 0 && blocks->module == module) ||                                                // Universe module
+                                          (ident->module == module && (blocks->module == module ||                                           // Current module
+                                          (ident->isExported && (rcvType || modules->module[blocks->module]->importAlias[ident->module]))));   // Imported module
+
+            if (identModuleValid)
             {
-                // What we found has correct name and block scope, check module scope
-                const bool identModuleValid = (ident->module == 0 && blocks->module == module) ||                                                // Universe module
-                                              (ident->module == module && (blocks->module == module ||                                           // Current module
-                                              (ident->exported && (rcvType || modules->module[blocks->module]->importAlias[ident->module]))));   // Imported module
+                // Method names need not be unique in the given scope - check the receiver type to see if we found the right name
+                const bool methodFound = ident->type->kind == TYPE_FN && ident->type->sig->isMethod;
 
-                if (identModuleValid)
+                const bool found = (!rcvType && !methodFound) || (rcvType && methodFound && typeCompatibleRcv(ident->type->sig->param[0]->type, rcvType));
+                if (found)
                 {
-                    // Method names need not be unique in the given scope - check the receiver type to see if we found the right name
-                    const bool methodFound = ident->type->kind == TYPE_FN && ident->type->sig.isMethod;
-
-                    const bool found = (!rcvType && !methodFound) || (rcvType && methodFound && typeCompatibleRcv(ident->type->sig.param[0]->type, rcvType));
-                    if (found)
-                    {
-                        if (markAsUsed)
-                            identSetUsed(ident);
-                        return ident;
-                    }
+                    if (markAsUsed)
+                        identSetUsed(ident);
+                    return ident;
                 }
             }
+        }
     }
 
     return NULL;
@@ -122,11 +144,54 @@ bool identIsOuterLocalVar(const Blocks *blocks, const Ident *ident)
 }
 
 
+static Ident *identTryResolveForwardType(Idents *idents, const Ident *existingIdent, IdentKind kind, const char *name, const Type *type, bool exported)
+{
+    if (existingIdent->kind == IDENT_TYPE && existingIdent->type->kind == TYPE_FORWARD &&
+        kind == IDENT_TYPE && type->kind != TYPE_FORWARD &&
+        strcmp(existingIdent->type->typeIdent->name, name) == 0)
+    {
+        if (existingIdent->type->resolveByStructured && !typeStructured(type))
+            idents->error->handler(idents->error->context, "Forward-declared type %s returned by a function must be a structured type", name);
+        
+        Ident *modifiableIdent = (Ident *)existingIdent;
+        Type *modifiableType = (Type *)type;
+        Type *modifiableIdentType = (Type *)existingIdent->type;
+
+        modifiableType->typeIdent = existingIdent;
+        typeDeepCopy(idents->storage, modifiableIdentType, type);
+        modifiableIdent->isExported = exported;
+
+        return modifiableIdent;
+    }
+    return NULL;
+}
+
+
+static Ident *identTryResolveFnPrototype(Idents *idents, const Ident *existingIdent, IdentKind kind, const char *name, const Type *type, bool exported)
+{
+    if (existingIdent->kind == IDENT_CONST && existingIdent->type->kind == TYPE_FN &&
+        kind == IDENT_CONST && type->kind == TYPE_FN &&
+        existingIdent->isExported == exported &&
+        strcmp(existingIdent->name, name) == 0 &&
+        typeCompatible(existingIdent->type, type) &&
+        existingIdent->prototypeOffset >= 0)
+    {
+        Ident *modifiableIdent = (Ident *)existingIdent;
+        Type *modifiableIdentType = (Type *)existingIdent->type;
+
+        typeDeepCopy(idents->storage, modifiableIdentType, type);
+
+        return modifiableIdent;
+    }
+    return NULL;
+}
+
+
 static Ident *identAdd(Idents *idents, const Modules *modules, const Blocks *blocks, IdentKind kind, const char *name, const Type *type, bool exported)
 {
     const Type *rcvType = NULL;
-    if (type->kind == TYPE_FN && type->sig.isMethod)
-        rcvType = type->sig.param[0]->type;
+    if (type->kind == TYPE_FN && type->sig->isMethod)
+        rcvType = type->sig->param[0]->type;
 
     const Ident *existingIdent = identFindEx(idents, modules, blocks, blocks->module, name, rcvType, false, kind == IDENT_MODULE);
 
@@ -134,37 +199,13 @@ static Ident *identAdd(Idents *idents, const Modules *modules, const Blocks *blo
     {
         if (existingIdent->block == blocks->item[blocks->top].block)
         {
-            // Forward type declaration resolution
-            if (existingIdent->kind == IDENT_TYPE && existingIdent->type->kind == TYPE_FORWARD &&
-                kind == IDENT_TYPE && type->kind != TYPE_FORWARD &&
-                strcmp(existingIdent->type->typeIdent->name, name) == 0)
-            {
-                Ident *modifiableIdent = (Ident *)existingIdent;
-                Type *modifiableType = (Type *)type;
-                Type *modifiableIdentType = (Type *)existingIdent->type;
+            Ident *resolvedForwardTypeIdent = identTryResolveForwardType(idents, existingIdent, kind, name, type, exported);
+            if (resolvedForwardTypeIdent)
+                return resolvedForwardTypeIdent;
 
-                modifiableType->typeIdent = existingIdent;
-                typeDeepCopy(idents->storage, modifiableIdentType, type);
-                modifiableIdent->exported = exported;
-
-                return modifiableIdent;
-            }
-
-            // Function prototype resolution
-            if (existingIdent->kind == IDENT_CONST && existingIdent->type->kind == TYPE_FN &&
-                kind == IDENT_CONST && type->kind == TYPE_FN &&
-                existingIdent->exported == exported &&
-                strcmp(existingIdent->name, name) == 0 &&
-                typeCompatible(existingIdent->type, type) &&
-                existingIdent->prototypeOffset >= 0)
-            {
-                Ident *modifiableIdent = (Ident *)existingIdent;
-                Type *modifiableIdentType = (Type *)existingIdent->type;
-
-                typeDeepCopy(idents->storage, modifiableIdentType, type);
-
-                return modifiableIdent;
-            }
+            Ident *resolvedFnPrototypeIdent = identTryResolveFnPrototype(idents, existingIdent, kind, name, type, exported);
+            if (resolvedFnPrototypeIdent)
+                return resolvedFnPrototypeIdent;
 
             idents->error->handler(idents->error->context, "Duplicate identifier %s", name);
         }
@@ -192,17 +233,16 @@ static Ident *identAdd(Idents *idents, const Modules *modules, const Blocks *blo
     strncpy(ident->name, name, MAX_IDENT_LEN);
     ident->name[MAX_IDENT_LEN] = 0;
 
-    ident->hash = hash(name);
-
-    ident->type              = type;
-    ident->module            = blocks->module;
-    ident->block             = blocks->item[blocks->top].block;
-    ident->exported          = exported;
-    ident->globallyAllocated = false;
-    ident->temporary         = false;
-    ident->used              = exported || ident->module == 0 || identIsHidden(ident->name) || identIsPlaceholder(ident->name) || identIsMain(ident);  // Exported, predefined, hidden, placeholder identifiers and main() are always treated as used
-    ident->prototypeOffset   = -1;
-    ident->debug             = *(idents->debug);
+    ident->type                = type;
+    ident->module              = blocks->module;
+    ident->block               = blocks->item[blocks->top].block;
+    ident->isExported          = exported;
+    ident->isGloballyAllocated = false;
+    ident->isTemporary         = false;
+    ident->isUsed              = exported || ident->module == 0 || identIsHidden(ident->name) || identIsPlaceholder(ident->name) || identIsMain(ident);  // Exported, predefined, hidden, placeholder identifiers and main() are always treated as used
+    ident->isGarbageCollected  = identIsGarbageCollected(blocks, ident);
+    ident->prototypeOffset     = -1;
+    ident->debug               = *(idents->debug);
 
     ident->next   = idents->first;
     idents->first = ident;
@@ -225,7 +265,7 @@ Ident *identAddTempConst(Idents *idents, const Modules *modules, const Blocks *b
     identTempName(idents, tempName);
 
     Ident *ident = identAddConst(idents, modules, blocks, tempName, type, false, constant);
-    ident->temporary = true;
+    ident->isTemporary = true;
     return ident;
 }
 
@@ -234,7 +274,7 @@ Ident *identAddGlobalVar(Idents *idents, const Modules *modules, const Blocks *b
 {
     Ident *ident = identAdd(idents, modules, blocks, IDENT_VAR, name, type, exported);
     ident->ptr = ptr;
-    ident->globallyAllocated = true;
+    ident->isGloballyAllocated = true;
     return ident;
 }
 
@@ -309,7 +349,7 @@ Ident *identAllocTempVar(Idents *idents, const Types *types, const Modules *modu
     identTempName(idents, tempName);
 
     Ident *ident = identAllocVar(idents, types, modules, blocks, tempName, type, false);
-    ident->temporary = true;
+    ident->isTemporary = true;
 
     if (isFuncResult)
     {
@@ -334,7 +374,7 @@ Ident *identAllocParam(Idents *idents, const Types *types, const Modules *module
 const char *identMethodNameWithRcv(const Idents *idents, const Ident *method)
 {
     char typeBuf[DEFAULT_STR_LEN + 1];
-    typeSpelling(method->type->sig.param[0]->type, typeBuf);
+    typeSpelling(method->type->sig->param[0]->type, typeBuf);
 
     char *buf = storageAdd(idents->storage, 2 * DEFAULT_STR_LEN + 2 + 1);
     snprintf(buf, 2 * DEFAULT_STR_LEN + 2 + 1, "(%s)%s", typeBuf, method->name);
@@ -345,7 +385,7 @@ const char *identMethodNameWithRcv(const Idents *idents, const Ident *method)
 
 void identWarnIfUnused(const Idents *idents, const Ident *ident)
 {
-    if (!ident->temporary && !ident->used)
+    if (!ident->isTemporary && !ident->isUsed)
     {
         idents->error->warningHandler(idents->error->context, &ident->debug, "%s %s is not used", (ident->kind == IDENT_MODULE ? "Module" : "Identifier"), ident->name);
         identSetUsed(ident);
@@ -353,16 +393,36 @@ void identWarnIfUnused(const Idents *idents, const Ident *ident)
 }
 
 
-void identWarnIfUnusedAll(const Idents *idents, int block)
+bool identIsMain(const Ident *ident)
 {
-    for (const Ident *ident = idents->first; ident; ident = ident->next)
-        if (ident->block == block)
-            identWarnIfUnused(idents, ident);
+    return  ident->kind == IDENT_CONST &&
+            ident->type->kind == TYPE_FN && 
+            !ident->type->sig->isMethod && 
+            ident->type->sig->numParams == 1 &&                          // A dummy #upvalues is the only parameter 
+            ident->type->sig->resultType->kind == TYPE_VOID &&
+            strcmp(ident->name, "main") == 0;
 }
 
 
-bool identIsMain(const Ident *ident)
+static bool identIsGarbageCollected(const Blocks *blocks, const Ident *ident)
 {
-    return strcmp(ident->name, "main") == 0 && ident->kind == IDENT_CONST &&
-           ident->type->kind == TYPE_FN && !ident->type->sig.isMethod && ident->type->sig.numParams == 1 && ident->type->sig.resultType->kind == TYPE_VOID;  // A dummy #upvalues is the only parameter
+    return  ident->kind == IDENT_VAR && 
+            ident->type->isGarbageCollected && 
+            strcmp(ident->name, "#result") != 0 && 
+            (strcmp(ident->name, "#upvalues") != 0 || blocks->item[blocks->top].hasUpvalues);     // Collect #upvalues only if used
+}
+
+
+const char *identSpellingByPtr(const Idents *idents, const void *ptr, char *buf)
+{
+    for (const Ident *ident = idents->first; ident; ident = ident->next)
+    {
+        if (ident->isGloballyAllocated && ptr == ident->ptr)
+        {
+            snprintf(buf, DEFAULT_STR_LEN + 1, "%s", ident->name);
+            return buf;
+        }
+    }
+    snprintf(buf, DEFAULT_STR_LEN + 1, "%p", ptr);
+    return buf;
 }

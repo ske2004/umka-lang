@@ -31,7 +31,6 @@ static const char *spelling [] =
     "in",
     "map",
     "return",
-    "str",
     "struct",
     "switch",
     "type",
@@ -106,15 +105,8 @@ enum
 };
 
 
-static unsigned int keywordHash[NUM_KEYWORDS];
-
-
 int lexInit(Lexer *lex, Storage *storage, DebugInfo *debug, const char *fileName, const char *sourceString, bool trusted, Error *error)
 {
-    // Fill keyword hashes
-    for (int i = 0; i < NUM_KEYWORDS; i++)
-        keywordHash[i] = hash(spelling[TOK_BREAK + i]);
-
     // Initialize lexer
     errno = 0;
 
@@ -185,9 +177,9 @@ void lexFree(Lexer *lex)
 }
 
 
-static char lexChar(Lexer *lex)
+static unsigned char lexChar(Lexer *lex)
 {
-    char ch = lex->buf[lex->bufPos];
+    const unsigned char ch = lex->buf[lex->bufPos];
     if (ch)
     {
         lex->bufPos++;
@@ -202,7 +194,7 @@ static char lexChar(Lexer *lex)
 }
 
 
-static char lexCharIf(Lexer *lex, char ch)
+static unsigned char lexCharIf(Lexer *lex, unsigned char ch)
 {
     if (lex->buf[lex->bufPos] == ch)
     {
@@ -213,10 +205,10 @@ static char lexCharIf(Lexer *lex, char ch)
 }
 
 
-static char lexEscChar(Lexer *lex, bool *escaped)
+static unsigned char lexEscChar(Lexer *lex, bool *escaped)
 {
     if (escaped) *escaped = false;
-    char ch = lexChar(lex);
+    unsigned char ch = lexChar(lex);
 
     if (ch == '\\')
     {
@@ -242,15 +234,11 @@ static char lexEscChar(Lexer *lex, bool *escaped)
                 const int items = sscanf(lex->buf + lex->bufPos, "%x%n", &hex, &len);
 
                 if (items < 1 || hex > 0xFF)
-                {
                     lex->error->handler(lex->error->context, "Illegal character code");
-                    lex->tok.kind = TOK_NONE;
-                    return 0;
-                }
 
                 lex->bufPos += len - 1;
                 lex->pos += len - 1;
-                return (char)hex;
+                return (unsigned char)hex;
             }
             default: return ch;
         }
@@ -261,7 +249,7 @@ static char lexEscChar(Lexer *lex, bool *escaped)
 
 static void lexSingleLineComment(Lexer *lex)
 {
-    char ch = lexChar(lex);
+    unsigned char ch = lexChar(lex);
     while (ch && ch != '\n')
         ch = lexChar(lex);
 }
@@ -269,27 +257,29 @@ static void lexSingleLineComment(Lexer *lex)
 
 static void lexMultiLineComment(Lexer *lex)
 {
-    char ch = lexChar(lex);
-    bool asteriskFound = false;
+    unsigned char ch = lexChar(lex);
 
-    while (ch && !(ch == '/' && asteriskFound))
+    while (ch)
     {
-        asteriskFound = false;
-
-        while (ch && ch != '*')
+        if (ch == '*')
+        {
             ch = lexChar(lex);
-
-        if (ch == '*') asteriskFound = true;
+            if (ch == '/')
+                break;
+        }
         ch = lexChar(lex);
     }
 
-    ch = lexChar(lex);
+    if (!ch)
+        lex->error->handler(lex->error->context, "Unterminated comment");
+
+    lexChar(lex);
 }
 
 
 static void lexSpacesAndComments(Lexer *lex)
 {
-    char ch = lex->buf[lex->bufPos];
+    unsigned char ch = lex->buf[lex->bufPos];
 
     while (ch && (ch == ' ' || ch == '\t' || ch == '\r' || ch == '/'))
     {
@@ -319,7 +309,7 @@ static void lexSpacesAndComments(Lexer *lex)
 static void lexKeywordOrIdent(Lexer *lex)
 {
     lex->tok.kind = TOK_NONE;
-    char ch = lex->buf[lex->bufPos];
+    unsigned char ch = lex->buf[lex->bufPos];
     int len = 0;
 
     do
@@ -334,15 +324,15 @@ static void lexKeywordOrIdent(Lexer *lex)
             return;
         }
     } while (((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
-              (ch >= '0' && ch <= '9') ||  ch == '_' || (lex->mode == MODE_UMX_TAG && ch == '-')));
+              (ch >= '0' && ch <= '9') ||  ch == '_' || (lex->mode == MODE_UMX_TAG && (ch == '-' || ch == '\\' || ch == ':')) ));
 
     lex->tok.name[len] = 0;
-    lex->tok.hash = hash(lex->tok.name);
 
     // Search for a keyword
+
     if (lex->mode != MODE_UMX_TAG)
         for (int i = 0; i < NUM_KEYWORDS; i++)
-            if (lex->tok.hash == keywordHash[i] && strcmp(lex->tok.name, spelling[TOK_BREAK + i]) == 0)
+            if (strcmp(lex->tok.name, spelling[TOK_BREAK + i]) == 0)
             {
                 lex->tok.kind = TOK_BREAK + i;
                 break;
@@ -356,7 +346,7 @@ static void lexKeywordOrIdent(Lexer *lex)
 static void lexOperator(Lexer *lex)
 {
     lex->tok.kind = TOK_NONE;
-    char ch = lex->buf[lex->bufPos];
+    unsigned char ch = lex->buf[lex->bufPos];
 
     switch (ch)
     {
@@ -669,7 +659,7 @@ static void lexOperator(Lexer *lex)
 }
 
 
-static int lexCharDigit(char c, int base)
+static int lexCharDigit(unsigned char c, int base)
 {
     switch (base)
     {
@@ -796,7 +786,7 @@ static void lexCharLiteral(Lexer *lex)
     lex->tok.kind = TOK_CHARLITERAL;
     lex->tok.intVal = lexEscChar(lex, NULL);
 
-    const char ch = lexChar(lex);
+    const unsigned char ch = lexChar(lex);
     if (ch != '\'')
     {
         lex->error->handler(lex->error->context, "Invalid character literal");
@@ -811,7 +801,7 @@ static int lexSingleLineStrLiteralAndGetSize(Lexer *lex)
     lex->tok.kind = TOK_STRLITERAL;
     int size = 0;
     bool escaped = false;
-    char ch = lexEscChar(lex, &escaped);
+    unsigned char ch = lexEscChar(lex, &escaped);
 
     while (ch != '\"' || escaped)
     {
@@ -837,7 +827,7 @@ static int lexMultiLineStrLiteralAndGetSize(Lexer *lex)
 {
     lex->tok.kind = TOK_STRLITERAL;
     int size = 0;
-    char ch = lexChar(lex);
+    unsigned char ch = lexChar(lex);
 
     while (ch != '`')
     {
@@ -1067,7 +1057,7 @@ static void lexNextWithEOLN(Lexer *lex)
     lex->tok.line = lex->debug->line = lex->line;
     lex->tok.pos = lex->pos;
 
-    const char ch = lex->buf[lex->bufPos];
+    const unsigned char ch = lex->buf[lex->bufPos];
     if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_')
         lexKeywordOrIdent(lex);
     else if ((ch >= '0' && ch <= '9') || ch == '.')
@@ -1101,7 +1091,6 @@ void lexNext(Lexer *lex)
             if (lex->prevTok.kind == TOK_BREAK       ||
                 lex->prevTok.kind == TOK_CONTINUE    ||
                 lex->prevTok.kind == TOK_RETURN      ||
-                lex->prevTok.kind == TOK_STR         ||
                 lex->prevTok.kind == TOK_PLUSPLUS    ||
                 lex->prevTok.kind == TOK_MINUSMINUS  ||
                 lex->prevTok.kind == TOK_RPAR        ||
@@ -1179,8 +1168,3 @@ TokenKind lexShortAssignment(TokenKind kind)
     }
 
 }
-
-
-
-
-

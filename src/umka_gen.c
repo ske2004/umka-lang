@@ -51,6 +51,12 @@ void genInit(CodeGen *gen, Storage *storage, DebugInfo *debug, Error *error)
 }
 
 
+void genResetOptimizer(CodeGen *gen)
+{
+    genUnnotify(gen);
+}
+
+
 static void genRealloc(CodeGen *gen)
 {
     gen->capacity *= 2;
@@ -196,16 +202,23 @@ static bool optimizeSwapAssign(CodeGen *gen, TypeKind typeKind, int structSize)
 }
 
 
-static bool optimizeChangeRefCnt(CodeGen *gen, const Type *type)
+static bool optimizeRefCnt(CodeGen *gen, const Type *type)
 {
     Instruction *prev = getPrevInstr(gen, 1);
 
-    // Optimization: PUSH ^ + CHANGE_REF_CNT -> PUSH ^
-    if (prev && prev->opcode == OP_PUSH && prev->inlineOpcode == OP_NOP && prev->typeKind == TYPE_PTR && (type->kind == TYPE_PTR || type->kind == TYPE_STR))
+    // Optimization: PUSH ^ + REF_CNT -> PUSH ^
+    if (prev && prev->opcode == OP_PUSH && prev->typeKind == TYPE_PTR && (type->kind == TYPE_PTR || type->kind == TYPE_STR))
     {
         genUnnotify(gen);
         return true;
     }
+
+    // Optimization: PUSH_LOCAL_PTR_ZERO + REF_CNT (structured type) -> PUSH_LOCAL_PTR_ZERO
+    if (prev && prev->opcode == OP_PUSH_LOCAL_PTR_ZERO && typeStructured(type))
+    {
+        genUnnotify(gen);
+        return true;
+    }    
 
     return false;
 }
@@ -215,8 +228,15 @@ static bool optimizeDeref(CodeGen *gen, TypeKind typeKind)
 {
     Instruction *prev = getPrevInstr(gen, 1);
 
+    // Optimization: PUSH ^ + DEREF -> PUSH_GLOBAL ^
+    if (prev && prev->opcode == OP_PUSH && prev->typeKind == TYPE_PTR)
+    {
+        genRemoveInstr(gen);
+        genPushGlobal(gen, typeKind, prev->operand.ptrVal);
+        return true;
+    }    
+
     // Optimization: PUSH_LOCAL_PTR + DEREF -> PUSH_LOCAL
-    // These sequences constitute 20...30 % of all instructions and need a special, more optimized single instruction
     if (prev && prev->opcode == OP_PUSH_LOCAL_PTR)
     {
         genRemoveInstr(gen);
@@ -224,18 +244,49 @@ static bool optimizeDeref(CodeGen *gen, TypeKind typeKind)
         return true;
     }
 
-    // Optimization: (PUSH | ...) + DEREF -> (PUSH | ...); DEREF
-    if (prev && ((prev->opcode == OP_PUSH && prev->typeKind == TYPE_PTR) ||
-                  prev->opcode == OP_GET_ARRAY_PTR                       ||
-                  prev->opcode == OP_GET_DYNARRAY_PTR                    ||
-                  prev->opcode == OP_GET_FIELD_PTR)                      &&
-                  prev->inlineOpcode == OP_NOP)
+    // Optimization: GET_ARRAY_PTR + DEREF -> GET_ARRAY
+    if (prev && prev->opcode == OP_GET_ARRAY_PTR)
     {
-        prev->inlineOpcode = OP_DEREF;
+        prev->opcode = OP_GET_ARRAY;
         prev->typeKind = typeKind;
         genUnnotify(gen);
         return true;
     }
+
+    // Optimization: GET_DYNARRAY_PTR + DEREF -> GET_DYNARRAY
+    if (prev && prev->opcode == OP_GET_DYNARRAY_PTR)
+    {
+        prev->opcode = OP_GET_DYNARRAY;
+        prev->typeKind = typeKind;
+        genUnnotify(gen);
+        return true;
+    }
+
+    // Optimization: GET_MAP_PTR + DEREF -> GET_MAP
+    if (prev && prev->opcode == OP_GET_MAP_PTR)
+    {
+        prev->opcode = OP_GET_MAP;
+        prev->typeKind = typeKind;
+        genUnnotify(gen);
+        return true;
+    }    
+
+    // Optimization: GET_FIELD_PTR 0 + DEREF -> DEREF
+    if (prev && prev->opcode == OP_GET_FIELD_PTR && prev->operand.intVal == 0)
+    {
+        genRemoveInstr(gen);
+        genDeref(gen, typeKind);
+        return true;
+    }    
+    
+    // Optimization: GET_FIELD_PTR + DEREF -> GET_FIELD
+    if (prev && prev->opcode == OP_GET_FIELD_PTR)
+    {
+        prev->opcode = OP_GET_FIELD;
+        prev->typeKind = typeKind;
+        genUnnotify(gen);
+        return true;
+    }    
 
     return false;
 }
@@ -246,7 +297,7 @@ static bool optimizeGetArrayPtr(CodeGen *gen, int itemSize, int len)
     Instruction *prev = getPrevInstr(gen, 1);
 
     // Optimization: PUSH + GET_ARRAY_PTR -> GET_FIELD_PTR
-    if (prev && prev->opcode == OP_PUSH && prev->typeKind == TYPE_INT && prev->inlineOpcode == OP_NOP && len >= 0)
+    if (prev && prev->opcode == OP_PUSH && prev->typeKind == TYPE_INT && len >= 0)
     {
         int index = prev->operand.intVal;
 
@@ -274,6 +325,14 @@ static bool optimizeGetFieldPtr(CodeGen *gen, int fieldOffset)
         return true;
     }
 
+    // Optimization: GET_FIELD_PTR (m) + GET_FIELD_PTR (n) -> GET_FIELD_PTR (m + n)
+    if (prev && prev->opcode == OP_GET_FIELD_PTR)
+    {
+        prev->operand.intVal += fieldOffset;
+        genUnnotify(gen);
+        return true;
+    }   
+
     return false;
 }
 
@@ -283,7 +342,7 @@ static bool optimizeUnary(CodeGen *gen, TokenKind tokKind, const Type *type)
     Instruction *prev = getPrevInstr(gen, 1);
 
     // Optimization: PUSH + UNARY -> PUSH
-    if (prev && prev->opcode == OP_PUSH && prev->inlineOpcode == OP_NOP && tokKind != TOK_PLUSPLUS && tokKind != TOK_MINUSMINUS)
+    if (prev && prev->opcode == OP_PUSH && tokKind != TOK_PLUSPLUS && tokKind != TOK_MINUSMINUS)
     {
         Const arg;
         if (typeReal(type))
@@ -314,8 +373,8 @@ static bool optimizeBinary(CodeGen *gen, TokenKind tokKind, const Type *type)
     Instruction *prev = getPrevInstr(gen, 1), *prev2 = getPrevInstr(gen, 2);
 
     // Optimization: PUSH + PUSH + BINARY -> PUSH
-    if (prev  && prev->opcode  == OP_PUSH && prev->inlineOpcode  == OP_NOP &&
-        prev2 && prev2->opcode == OP_PUSH && prev2->inlineOpcode == OP_NOP &&
+    if (prev  && prev->opcode  == OP_PUSH && 
+        prev2 && prev2->opcode == OP_PUSH &&
        (typeOrdinal(type) || typeReal(type) || type->kind == TYPE_BOOL))
     {
         Const lhs, rhs;
@@ -363,22 +422,22 @@ static bool optimizeCallBuiltin(CodeGen *gen, TypeKind typeKind, BuiltinFunc bui
     Instruction *prev = getPrevInstr(gen, 1), *prev2 = getPrevInstr(gen, 2);
 
     // Optimization: PUSH + CALL_BUILTIN -> PUSH
-    if (prev && prev->opcode == OP_PUSH && prev->inlineOpcode == OP_NOP)
+    if (prev && prev->opcode == OP_PUSH)
     {
         Const arg = {0}, arg2 = {0};
         TypeKind resultTypeKind = TYPE_NONE;
 
         switch (builtin)
         {
-            case BUILTIN_REAL:
+            case BUILTIN_MAKEREAL:
             {
                 arg.intVal = prev->operand.intVal;
                 resultTypeKind = TYPE_REAL;
                 break;
             }
-            case BUILTIN_REAL_LHS:
+            case BUILTIN_MAKEREALLEFT:
             {
-                if (prev2 && prev2->opcode == OP_PUSH && prev2->inlineOpcode == OP_NOP)
+                if (prev2 && prev2->opcode == OP_PUSH)
                 {
                     arg.intVal = prev2->operand.intVal;
                     resultTypeKind = TYPE_REAL;
@@ -410,7 +469,7 @@ static bool optimizeCallBuiltin(CodeGen *gen, TypeKind typeKind, BuiltinFunc bui
             }
             case BUILTIN_ATAN2:
             {
-                if (prev2 && prev2->opcode == OP_PUSH && prev2->inlineOpcode == OP_NOP)
+                if (prev2 && prev2->opcode == OP_PUSH)
                 {
                     arg.realVal = prev2->operand.realVal;
                     arg2.realVal = prev->operand.realVal;
@@ -478,6 +537,13 @@ void genPushRealConst(CodeGen *gen, double realVal)
 void genPushGlobalPtr(CodeGen *gen, void *ptrVal)
 {
     const Instruction instr = {.opcode = OP_PUSH, .tokKind = TOK_NONE, .typeKind = TYPE_PTR, .operand.ptrVal = ptrVal};
+    genAddInstr(gen, &instr);
+}
+
+
+void genPushGlobal(CodeGen *gen, TypeKind typeKind, void *ptrVal)
+{
+    const Instruction instr = {.opcode = OP_PUSH_GLOBAL, .tokKind = TOK_NONE, .typeKind = typeKind, .operand.ptrVal = ptrVal};
     genAddInstr(gen, &instr);
 }
 
@@ -595,7 +661,7 @@ void genSwapAssign(CodeGen *gen, TypeKind typeKind, int structSize)
 {
     if (!optimizeSwapAssign(gen, typeKind, structSize))
     {
-        const Instruction instr = {.opcode = OP_ASSIGN, .inlineOpcode = OP_SWAP, .tokKind = TOK_NONE, .typeKind = typeKind, .operand.intVal = structSize};
+        const Instruction instr = {.opcode = OP_SWAP_ASSIGN, .tokKind = TOK_NONE, .typeKind = typeKind, .operand.intVal = structSize};
         genAddInstr(gen, &instr);
     }
 }
@@ -608,41 +674,41 @@ void genAssignParam(CodeGen *gen, TypeKind typeKind, int structSize)
 }
 
 
-void genChangeRefCnt(CodeGen *gen, TokenKind tokKind, const Type *type)
+void genRefCnt(CodeGen *gen, TokenKind tokKind, const Type *type)
 {
-    if (typeGarbageCollected(type) && !optimizeChangeRefCnt(gen, type))
+    if (type->isGarbageCollected && !optimizeRefCnt(gen, type))
     {
-        const Instruction instr = {.opcode = OP_CHANGE_REF_CNT, .tokKind = tokKind, .type = type};
+        const Instruction instr = {.opcode = OP_REF_CNT, .tokKind = tokKind, .type = type};
         genAddInstr(gen, &instr);
     }
 }
 
 
-void genChangeRefCntGlobal(CodeGen *gen, TokenKind tokKind, void *ptrVal, const Type *type)
+void genRefCntGlobal(CodeGen *gen, TokenKind tokKind, void *ptrVal, const Type *type)
 {
-    if (typeGarbageCollected(type))
+    if (type->isGarbageCollected)
     {
-        const Instruction instr = {.opcode = OP_CHANGE_REF_CNT_GLOBAL, .tokKind = tokKind, .operand.ptrVal = ptrVal, .type = type};
+        const Instruction instr = {.opcode = OP_REF_CNT_GLOBAL, .tokKind = tokKind, .operand.ptrVal = ptrVal, .type = type};
         genAddInstr(gen, &instr);
     }
 }
 
 
-void genChangeRefCntLocal(CodeGen *gen, TokenKind tokKind, int offset, const Type *type)
+void genRefCntLocal(CodeGen *gen, TokenKind tokKind, int offset, const Type *type)
 {
-    if (typeGarbageCollected(type))
+    if (type->isGarbageCollected)
     {
-        const Instruction instr = {.opcode = OP_CHANGE_REF_CNT_LOCAL, .tokKind = tokKind, .operand.intVal = offset, .type = type};
+        const Instruction instr = {.opcode = OP_REF_CNT_LOCAL, .tokKind = tokKind, .operand.intVal = offset, .type = type};
         genAddInstr(gen, &instr);
     }
 }
 
 
-void genChangeRefCntAssign(CodeGen *gen, const Type *type)
+void genRefCntAssign(CodeGen *gen, const Type *type)
 {
-    if (typeGarbageCollected(type))
+    if (type->isGarbageCollected)
     {
-        const Instruction instr = {.opcode = OP_CHANGE_REF_CNT_ASSIGN, .tokKind = TOK_NONE, .type = type};
+        const Instruction instr = {.opcode = OP_REF_CNT_ASSIGN, .tokKind = TOK_NONE, .type = type};
         genAddInstr(gen, &instr);
     }
     else
@@ -650,11 +716,11 @@ void genChangeRefCntAssign(CodeGen *gen, const Type *type)
 }
 
 
-void genSwapChangeRefCntAssign(CodeGen *gen, const Type *type)
+void genSwapRefCntAssign(CodeGen *gen, const Type *type)
 {
-    if (typeGarbageCollected(type))
+    if (type->isGarbageCollected)
     {
-        const Instruction instr = {.opcode = OP_CHANGE_REF_CNT_ASSIGN, .inlineOpcode = OP_SWAP, .tokKind = TOK_NONE, .type = type};
+        const Instruction instr = {.opcode = OP_SWAP_REF_CNT_ASSIGN, .tokKind = TOK_NONE, .type = type};
         genAddInstr(gen, &instr);
     }
     else
@@ -662,11 +728,11 @@ void genSwapChangeRefCntAssign(CodeGen *gen, const Type *type)
 }
 
 
-void genChangeLeftRefCntAssign(CodeGen *gen, const Type *type)
+void genLeftRefCntAssign(CodeGen *gen, const Type *type)
 {
-    if (typeGarbageCollected(type))
+    if (type->isGarbageCollected)
     {
-        const Instruction instr = {.opcode = OP_CHANGE_REF_CNT_ASSIGN, .tokKind = TOK_MINUSMINUS, .type = type};
+        const Instruction instr = {.opcode = OP_REF_CNT_ASSIGN, .tokKind = TOK_MINUSMINUS, .type = type};
         genAddInstr(gen, &instr);
     }
     else
@@ -834,9 +900,9 @@ void genReturn(CodeGen *gen, int paramSlots)
 }
 
 
-void genEnterFrame(CodeGen *gen, const ParamAndLocalVarLayout *layout)
+void genEnterFrame(CodeGen *gen, const StackFrameLayout *layout)
 {
-    const Instruction instr = {.opcode = OP_ENTER_FRAME, .tokKind = TOK_NONE, .typeKind = TYPE_NONE, .operand.ptrVal = (ParamAndLocalVarLayout *)layout};
+    const Instruction instr = {.opcode = OP_ENTER_FRAME, .tokKind = TOK_NONE, .typeKind = TYPE_NONE, .operand.ptrVal = (StackFrameLayout *)layout};
     genAddInstr(gen, &instr);
 }
 
@@ -1046,7 +1112,7 @@ void genEnterFrameStub(CodeGen *gen)
 }
 
 
-void genLeaveFrameFixup(CodeGen *gen, const ParamAndLocalVarLayout *layout)
+void genLeaveFrameFixup(CodeGen *gen, const StackFrameLayout *layout)
 {
     // Fixup enter stub
     int next = gen->ip;
@@ -1068,7 +1134,7 @@ void genEntryPoint(CodeGen *gen, int start)
 int genTryRemoveImmediateEntryPoint(CodeGen *gen)
 {
     Instruction *prev = getPrevInstr(gen, 1);
-    if (prev && prev->opcode == OP_PUSH && prev->inlineOpcode == OP_NOP)
+    if (prev && prev->opcode == OP_PUSH)
     {
         int entry = prev->operand.intVal;
         genRemoveInstr(gen);
@@ -1119,9 +1185,9 @@ int genTryRemoveCopyResultToTempVar(CodeGen *gen)
 
     Instruction *prev = getPrevInstr(gen, 1), *prev2 = getPrevInstr(gen, 2), *prev3 = getPrevInstr(gen, 3);
 
-    if (prev3 && prev3->opcode == OP_DUP            && prev3->inlineOpcode == OP_NOP &&
-        prev2 && prev2->opcode == OP_PUSH_LOCAL_PTR && prev2->inlineOpcode == OP_NOP &&
-        prev  && prev->opcode  == OP_ASSIGN         && prev->inlineOpcode  == OP_SWAP)
+    if (prev3 && prev3->opcode == OP_DUP &&
+        prev2 && prev2->opcode == OP_PUSH_LOCAL_PTR &&
+        prev  && prev->opcode  == OP_SWAP_ASSIGN)
     {
         int tempVarOffset = prev2->operand.intVal;
         genRemoveInstr(gen);
@@ -1137,7 +1203,7 @@ int genTryRemoveCopyResultToTempVar(CodeGen *gen)
 
 // Assembly output
 
-int genAsm(CodeGen *gen, char *buf, int size)
+int genAsm(CodeGen *gen, const Idents *idents, char *buf, int size)
 {
     bool *jumpFrom = storageAdd(gen->storage, gen->capacity + 1);
     bool *jumpTo = storageAdd(gen->storage, gen->capacity + 1);
@@ -1157,16 +1223,16 @@ int genAsm(CodeGen *gen, char *buf, int size)
     do
     {
         if (ip == 0 || gen->debugPerInstr[ip].fileName != gen->debugPerInstr[ip - 1].fileName)
-            chars += snprintf(buf + chars, nonneg(size - chars), "\nModule: %s\n\n", gen->debugPerInstr[ip].fileName);
+            chars += snprintf(nonnull(buf, chars), nonneg(size - chars), "\nModule: %s\n\n", gen->debugPerInstr[ip].fileName);
 
         if (gen->code[ip].opcode == OP_ENTER_FRAME)
-            chars += snprintf(buf + chars, nonneg(size - chars), "\nFunction: %s\n\n", gen->debugPerInstr[ip].fnName);
+            chars += snprintf(nonnull(buf, chars), nonneg(size - chars), "\nFunction: %s\n\n", gen->debugPerInstr[ip].fnName);
 
-        chars += vmAsm(ip, gen->code, gen->debugPerInstr, buf + chars, nonneg(size - chars));
-        chars += snprintf(buf + chars, nonneg(size - chars), "\n");
+        chars += vmAsm(ip, gen->code, gen->debugPerInstr, idents, nonnull(buf, chars), nonneg(size - chars));
+        chars += snprintf(nonnull(buf, chars), nonneg(size - chars), "\n");
 
         if (gen->code[ip].opcode == OP_RETURN || jumpFrom[ip] || jumpTo[ip + 1])
-            chars += snprintf(buf + chars, nonneg(size - chars), "\n");
+            chars += snprintf(nonnull(buf, chars), nonneg(size - chars), "\n");
 
     } while (gen->code[ip++].opcode != OP_HALT);
 

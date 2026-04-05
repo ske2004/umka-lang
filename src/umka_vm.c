@@ -3,7 +3,6 @@
 //#define UMKA_VM_DEBUG
 //#define UMKA_STR_DEBUG
 //#define UMKA_REF_CNT_DEBUG
-//#define UMKA_DETAILED_LEAK_INFO
 
 #ifdef UMKA_VM_DEBUG
     #define FORCE_INLINE
@@ -29,6 +28,7 @@
 #include <inttypes.h>
 
 #include "umka_vm.h"
+#include "umka_ident.h"
 
 
 /*
@@ -47,11 +47,11 @@ Virtual machine stack layout (64-bit slots):
     Local variable 0
     ...
     Local variable 0
-    Parameter layout table pointer
+    Stack frame layout table pointer
     Stack frame ref count
     Caller's stack frame base pointer                <- Stack frame base pointer
     Return address
-    Parameter N                                      <- Parameter array (external functions only)
+    Parameter N                                      <- Parameter array passed to external functions
     ...
     Parameter N
     Parameter N - 1
@@ -65,6 +65,7 @@ static const char *opcodeSpelling [] =
 {
     "NOP",
     "PUSH",
+    "PUSH_GLOBAL",
     "PUSH_ZERO",
     "PUSH_LOCAL_PTR",
     "PUSH_LOCAL_PTR_ZERO",
@@ -78,17 +79,23 @@ static const char *opcodeSpelling [] =
     "ZERO",
     "DEREF",
     "ASSIGN",
+    "SWAP_ASSIGN",
     "ASSIGN_PARAM",
-    "CHANGE_REF_CNT",
-    "CHANGE_REF_CNT_GLOBAL",
-    "CHANGE_REF_CNT_LOCAL",
-    "CHANGE_REF_CNT_ASSIGN",
+    "REF_CNT",
+    "REF_CNT_GLOBAL",
+    "REF_CNT_LOCAL",
+    "REF_CNT_ASSIGN",
+    "SWAP_REF_CNT_ASSIGN",
     "UNARY",
     "BINARY",
     "GET_ARRAY_PTR",
+    "GET_ARRAY",
     "GET_DYNARRAY_PTR",
+    "GET_DYNARRAY",
     "GET_MAP_PTR",
+    "GET_MAP",
     "GET_FIELD_PTR",
+    "GET_FIELD",
     "ASSERT_TYPE",
     "ASSERT_RANGE",
     "WEAKEN_PTR",
@@ -115,8 +122,8 @@ static const char *builtinSpelling [] =
     "scanf",
     "fscanf",
     "sscanf",
-    "real",
-    "real_lhs",
+    "makereal",
+    "makerealleft",
     "round",
     "trunc",
     "ceil",
@@ -134,8 +141,8 @@ static const char *builtinSpelling [] =
     "make",
     "makefromarr",
     "makefromstr",
-    "maketoarr",
-    "maketostr",
+    "makearr",
+    "makestr",
     "copy",
     "append",
     "insert",
@@ -156,6 +163,7 @@ static const char *builtinSpelling [] =
     "keys",
     "resume",
     "memusage",
+    "leaksan",
     "exit"
 };
 
@@ -174,25 +182,28 @@ static const char *regSpelling [] =
 
 static FORCE_INLINE UmkaStackSlot *doGetOnFreeParams(void *ptr)
 {  
-    static char layoutBuf[PARAM_LAYOUT_SIZE(2)];
-    ParamLayout *layout = (ParamLayout *)&layoutBuf;
+    static char layoutBuf[STACK_FRAME_LAYOUT_SIZE(2)];
+    StackFrameLayout *layout = (StackFrameLayout *)&layoutBuf;
 
-    layout->numParams = 2;
-    layout->numParamSlots = 1;
-    layout->numResultParams = 0;
-    layout->firstSlotIndex[0] = 0;     // No upvalues
-    layout->firstSlotIndex[1] = 0;     // Pointer to data to deallocate
+    ParamLayout *paramLayout = (ParamLayout *)getParamLayout(layout);
+    paramLayout->numParams = 2;
+    paramLayout->numParamSlots = 1;
+    paramLayout->numResultParams = 0;
+    paramLayout->firstSlotIndex[0] = 0;     // No upvalues
+    paramLayout->firstSlotIndex[1] = 0;     // Pointer to data to deallocate
 
-    ParamLayoutTypes *layoutTypes = PARAM_LAYOUT_TYPES(layout);
-
-    layoutTypes->resultType = NULL;
-    layoutTypes->paramType[0] = NULL;
-    layoutTypes->paramType[1] = NULL;      
+    ParamTypes *paramTypes = (ParamTypes *)getParamTypes(layout);
+    paramTypes->resultType = NULL;
+    paramTypes->paramType[0] = NULL;
+    paramTypes->paramType[1] = NULL; 
+    
+    LocalVarLayout *localVarLayout = (LocalVarLayout *)getLocalVarLayout(layout);
+    localVarLayout->localVarSlots = 0;
 
     static UmkaStackSlot paramsBuf[4 + 1] = {0};
     UmkaStackSlot *params = paramsBuf + 4;
 
-    *vmGetParamLayout(params) = layout;
+    *vmGetStackFrameLayout(params) = layout;
     
     params[0].ptrVal = ptr;
 
@@ -211,31 +222,136 @@ static FORCE_INLINE UmkaStackSlot *doGetOnFreeResult(HeapPages *pages)
 }
 
 
-static void pageInit(HeapPages *pages, Fiber *fiber, Error *error)
+static FORCE_INLINE void candidateInit(RefCntCandidates *candidates, Storage *storage)
 {
-    pages->first = NULL;
-    pages->lastAccessed = NULL;
-    pages->lowest = pages->highest = NULL;
-    pages->freeId = 1;
-    pages->totalSize = 0;
-    pages->fiber = fiber;
-    pages->error = error;
+    candidates->storage = storage;
+    candidates->capacity = 100;
+    candidates->stack = storageAdd(candidates->storage, candidates->capacity * sizeof(RefCntCandidate));
+    candidates->top = -1;
 }
 
 
-static void pageFree(HeapPages *pages, bool warnLeak)
+static FORCE_INLINE void candidateReset(RefCntCandidates *candidates)
 {
-    HeapPage *page = pages->first;
-    while (page)
+    candidates->top = -1;
+}
+
+
+static FORCE_INLINE void candidatePush(RefCntCandidates *candidates, void *ptr, const Type *type)
+{
+    if (candidates->top >= candidates->capacity - 1)
     {
-        HeapPage *next = page->next;
+        candidates->capacity *= 2;
+        candidates->stack = storageRealloc(candidates->storage, candidates->stack, candidates->capacity * sizeof(RefCntCandidate));
+    }
 
-        // Report memory leaks
-        if (warnLeak)
+    RefCntCandidate *candidate = &candidates->stack[++candidates->top];
+    candidate->ptr = ptr;
+    candidate->type = type;
+    candidate->pageForDeferred = NULL;
+}
+
+
+static FORCE_INLINE void candidatePushDeferred(RefCntCandidates *candidates, void *ptr, const Type *type, HeapPage *page)
+{
+    candidatePush(candidates, ptr, type);
+    candidates->stack[candidates->top].pageForDeferred = page;
+}
+
+
+static FORCE_INLINE void candidatePop(RefCntCandidates *candidates, void **ptr, const Type **type, HeapPage **page)
+{
+    RefCntCandidate *candidate = &candidates->stack[candidates->top--];
+    *ptr = candidate->ptr;
+    *type = candidate->type;
+    *page = candidate->pageForDeferred;
+}
+
+
+static FORCE_INLINE const StackFrameLayout *stackGetFrameLayout(const Slot *base)
+{
+    return base[-2].ptrVal;
+}
+
+
+static FORCE_INLINE int64_t *stackGetFrameRefCnt(const Slot *base)
+{
+    return (int64_t *)&base[-1].intVal;
+}
+
+
+static FORCE_INLINE int stackGetFrameReturnOffset(const Slot *base)
+{
+    return base[1].intVal;
+}
+
+
+static FORCE_INLINE Slot *stackGetFrameParams(const Slot *base)
+{
+    return (Slot *)&base[2];
+}
+
+
+static FORCE_INLINE const Slot *stackGetFrameLocalVars(const Slot *base, const StackFrameLayout *layout)
+{
+    return (const Slot *)(base - 2 - getLocalVarLayout(layout)->localVarSlots);
+}
+
+
+static FORCE_INLINE bool stackUnwind(Fiber *fiber, const Slot **base, int *ip)
+{
+    if (*base == fiber->stack + fiber->stackSize - 1)
+        return false;
+
+    const int returnOffset = stackGetFrameReturnOffset(*base);
+    if (returnOffset == RETURN_FROM_FIBER || returnOffset == RETURN_FROM_VM)
+        return false;
+
+    *base = (*base)->ptrVal;
+    if (ip)
+        *ip = returnOffset;
+    return true;
+}
+
+
+static FORCE_INLINE void stackUpdateFrameRefCnt(Fiber *fiber, HeapPages *pages, void *ptr, int delta)
+{
+    if (ptr >= (void *)fiber->top && ptr < (void *)(fiber->stack + fiber->stackSize))
+    {
+        const Slot *base = fiber->base;
+        const StackFrameLayout *layout = stackGetFrameLayout(base);
+
+        while (ptr >= (void *)(stackGetFrameParams(base) + getParamLayout(layout)->numParamSlots))
         {
-            fprintf(stderr, "Warning: Memory leak at %p (%d refs)\n", page->data, page->refCnt);
+            if (UNLIKELY(!stackUnwind(fiber, &base, NULL)))
+                pages->error->runtimeHandler(pages->error->context, ERR_RUNTIME, "Illegal stack pointer");
 
-#ifdef UMKA_DETAILED_LEAK_INFO
+            layout = stackGetFrameLayout(base);
+        }
+
+        *stackGetFrameRefCnt(base) += delta;
+    }
+}
+
+
+static void pageLeakSan(HeapPages *pages, const HeapPage *page, Storage *storage)
+{
+    typedef struct tagLeakLocation
+    {
+        const Type *type;
+        const DebugInfo *debug;
+        const struct tagLeakLocation *next;
+    } LeakLocation;
+    
+    if (pages->leakSanLevel > 0 && pages->fiber && pages->fiber->vm->terminatedNormally)
+    {
+        fprintf(stderr, "LeakSan: Memory leak on page %p (%d refs)\n", page->data, page->refCnt);
+
+        if (pages->leakSanLevel > 1)
+        {
+            // Report each leak location only once
+            const LeakLocation *firstLoc = NULL;
+
             for (int i = 0; i < page->numOccupiedChunks; i++)
             {
                 const HeapChunk *chunk = (const HeapChunk *)(page->data + i * page->chunkSize);
@@ -243,10 +359,54 @@ static void pageFree(HeapPages *pages, bool warnLeak)
                     continue;
 
                 const DebugInfo *debug = &pages->fiber->debugPerInstr[chunk->ip];
-                fprintf(stderr, "    Chunk allocated in %s: %s (%d)\n", debug->fnName, debug->fileName, debug->line);
-            }
-#endif
+
+                bool reported = false;
+                for (const LeakLocation *loc = firstLoc; loc; loc = loc->next)
+                {
+                    if (chunk->type == loc->type && debug->fileName == loc->debug->fileName && debug->fnName == loc->debug->fnName && debug->line == loc->debug->line)
+                    {
+                        reported = true;
+                        break;
+                    }
+                }
+
+                if (reported)
+                    continue;
+
+                LeakLocation *newLoc = storageAdd(storage, sizeof(LeakLocation));
+                *newLoc = (LeakLocation){.type = chunk->type, .debug = debug, .next = firstLoc};
+                firstLoc = newLoc;
+
+                char typeBuf[DEFAULT_STR_LEN + 1];
+                fprintf(stderr, "LeakSan:    %s in %s: %s (%d)\n", chunk->type ? typeSpelling(chunk->type, typeBuf) : "?", debug->fnName, debug->fileName, debug->line);
+            }                
         }
+    }
+}
+
+
+static void pageInit(HeapPages *pages, Fiber *fiber, Storage *storage, Error *error)
+{
+    pages->first = pages->firstRecycled = pages->firstBlacklisted = pages->lastAccessed = NULL;
+    pages->lowest = pages->highest = NULL;
+    pages->freeId = 1;
+    pages->totalSize = pages->blacklistedSize = 0;
+    pages->fiber = fiber;
+    pages->leakSanLevel = 1;
+    candidateInit(&pages->refCntCandidates, storage);
+    pages->error = error;
+}
+
+
+static void pageFree(HeapPages *pages, Storage *storage)
+{
+    // Remove remaining reference-counted pages
+    for (HeapPage *page = pages->first; page;)
+    {
+        HeapPage *next = page->next;
+
+        // Report memory leaks
+        pageLeakSan(pages, page, storage);
 
         // Call custom deallocators, if any
         for (int i = 0; i < page->numOccupiedChunks && page->numChunksWithOnFree > 0; i++)
@@ -262,16 +422,140 @@ static void pageFree(HeapPages *pages, bool warnLeak)
         free(page);
         page = next;
     }
+
+    // Remove remaining recycled pages
+    for (HeapPage *page = pages->firstRecycled; page;)
+    {
+        HeapPage *next = page->next;
+        free(page);
+        page = next;
+    }
+
+    // Remove remaining blacklisted pages
+    for (HeapPage *page = pages->firstBlacklisted; page;)
+    {
+        HeapPage *next = page->next;
+        free(page);
+        page = next;
+    }    
+}
+
+
+static FORCE_INLINE void pageMoveToRecycled(HeapPages *pages, HeapPage *page)
+{
+    page->next = pages->firstRecycled;
+    pages->firstRecycled = page;
+}
+
+
+static FORCE_INLINE HeapPage *pageFindRecycled(HeapPages *pages, int size)
+{
+    while (pages->firstRecycled)
+    {
+        HeapPage *page = pages->firstRecycled;
+        pages->firstRecycled = pages->firstRecycled->next;
+        
+        const int recycledSize = page->numChunks * page->chunkSize;
+        if (recycledSize >= size)
+            return page;
+
+        free(page);
+
+        pages->totalSize -= recycledSize;
+    }
+
+    return NULL;   
+}
+
+
+static FORCE_INLINE bool pageMayBeReferencedByTemporaries(HeapPages *pages, const HeapPage *page)
+{
+    // Naive Deutsch-Bobrow-style conservative stack scanning for temporaries referencing the page
+    for (Fiber *fiber = pages->fiber; fiber; fiber = fiber->parent)
+    {
+        const Slot *base = fiber->base;
+        const Slot *temporariesTop = fiber->top;
+        do
+        {
+            const StackFrameLayout *layout = stackGetFrameLayout(base);
+            if (!layout)
+                break;
+
+            const Slot *localVarsTop = stackGetFrameLocalVars(base, layout);
+
+            for (const Slot *temporary = temporariesTop; temporary < localVarsTop; temporary++)
+            {
+                // Everything that looks like a pointer into the page may be a pointer
+                if (temporary->ptrVal >= (void *)page->data && temporary->ptrVal < (void *)page->end)
+                    return true;
+            }
+
+            temporariesTop = stackGetFrameParams(base) + getParamLayout(layout)->numParamSlots;
+        } while (stackUnwind(fiber, &base, NULL));    
+    }
+
+    return false;
+}
+
+
+static FORCE_INLINE void pageMoveBlacklistedToRecycled(HeapPages *pages)
+{
+    if (pages->blacklistedSize < MEM_MAX_BLACKLISTED)
+        return;
+    
+    for (HeapPage *page = pages->firstBlacklisted; page;)
+    {
+        HeapPage *next = page->next;
+        if (!pageMayBeReferencedByTemporaries(pages, page))
+        {
+            if (page == pages->firstBlacklisted)
+                pages->firstBlacklisted = page->next;
+
+            if (page->prev)
+                page->prev->next = page->next;
+
+            if (page->next)
+                page->next->prev = page->prev;
+
+            pageMoveToRecycled(pages, page);
+
+            pages->blacklistedSize -= page->numChunks * page->chunkSize;     
+        }
+        page = next; 
+    }
+}
+
+
+static FORCE_INLINE void pageMoveToBlacklisted(HeapPages *pages, HeapPage *page)
+{  
+    pageMoveBlacklistedToRecycled(pages);
+    
+    page->prev = NULL;
+    page->next = pages->firstBlacklisted;
+
+    if (pages->firstBlacklisted)
+        pages->firstBlacklisted->prev = page;
+
+    pages->firstBlacklisted = page;
+
+    pages->blacklistedSize += page->numChunks * page->chunkSize;
 }
 
 
 static FORCE_INLINE HeapPage *pageAdd(HeapPages *pages, int numChunks, int chunkSize)
 {
     const int size = numChunks * chunkSize;
+    
+    // Try finding a recycled page
+    HeapPage *page = pageFindRecycled(pages, size);
+    if (!page)
+    {
+        page = malloc(sizeof(HeapPage) + size);
+        if (UNLIKELY(!page))
+            pages->error->runtimeHandler(pages->error->context, ERR_RUNTIME, "Out of memory");
 
-    HeapPage *page = malloc(sizeof(HeapPage) + size);
-    if (UNLIKELY(!page))
-        pages->error->runtimeHandler(pages->error->context, ERR_RUNTIME, "Out of memory");
+        pages->totalSize += size;
+    }
 
     page->id = pages->freeId++;
     page->refCnt = 0;
@@ -282,8 +566,6 @@ static FORCE_INLINE HeapPage *pageAdd(HeapPages *pages, int numChunks, int chunk
     page->prev = NULL;
     page->next = pages->first;
     page->end = page->data + size;
-
-    pages->totalSize += size;
 
     if (pages->first)
         pages->first->prev = page;
@@ -305,13 +587,11 @@ static FORCE_INLINE HeapPage *pageAdd(HeapPages *pages, int numChunks, int chunk
 }
 
 
-static FORCE_INLINE void pageRemove(HeapPages *pages, HeapPage *page)
+static FORCE_INLINE void pageRemove(HeapPages *pages, HeapPage *page, bool blacklist)
 {
 #ifdef UMKA_REF_CNT_DEBUG
     fprintf(stderr, "Remove page at %p\n", page->data);
 #endif
-
-    pages->totalSize -= page->numChunks * page->chunkSize;
 
     if (page == pages->first)
         pages->first = page->next;
@@ -323,9 +603,12 @@ static FORCE_INLINE void pageRemove(HeapPages *pages, HeapPage *page)
         page->next->prev = page->prev;
 
     if (page == pages->lastAccessed)
-        pages->lastAccessed = pages->first;        
-
-    free(page);
+        pages->lastAccessed = pages->first; 
+        
+    if (blacklist)
+        pageMoveToBlacklisted(pages, page);
+    else
+        pageMoveToRecycled(pages, page);
 }
 
 
@@ -413,43 +696,6 @@ static FORCE_INLINE HeapPage *pageFindById(HeapPages *pages, int id)
 }
 
 
-static FORCE_INLINE bool stackUnwind(Fiber *fiber, Slot **base, int *ip)
-{
-    if (*base == fiber->stack + fiber->stackSize - 1)
-        return false;
-
-    const int returnOffset = (*base + 1)->intVal;
-    if (returnOffset == RETURN_FROM_FIBER || returnOffset == RETURN_FROM_VM)
-        return false;
-
-    *base = (Slot *)((*base)->ptrVal);
-    if (ip)
-        *ip = returnOffset;
-    return true;
-}
-
-
-static FORCE_INLINE void stackChangeFrameRefCnt(Fiber *fiber, HeapPages *pages, void *ptr, int delta)
-{
-    if (ptr >= (void *)fiber->top && ptr < (void *)(fiber->stack + fiber->stackSize))
-    {
-        Slot *base = fiber->base;
-        const ParamLayout *paramLayout = base[-2].ptrVal;
-
-        while (ptr > (void *)(base + 1 + paramLayout->numParamSlots))   // + 1 for return address
-        {
-            if (UNLIKELY(!stackUnwind(fiber, &base, NULL)))
-                pages->error->runtimeHandler(pages->error->context, ERR_RUNTIME, "Illegal stack pointer");
-
-            paramLayout = base[-2].ptrVal;
-        }
-
-        int64_t *stackFrameRefCnt = &base[-1].intVal;
-        *stackFrameRefCnt += delta;
-    }
-}
-
-
 static FORCE_INLINE void *chunkAlloc(HeapPages *pages, int64_t size, const Type *type, UmkaExternFunc onFree, bool isStack, Error *error)
 {
     // Page layout: header, data, footer (char), padding, header, data, footer (char), padding...
@@ -492,7 +738,7 @@ static FORCE_INLINE void *chunkAlloc(HeapPages *pages, int64_t size, const Type 
 }
 
 
-static FORCE_INLINE int chunkChangeRefCnt(HeapPages *pages, HeapPage *page, void *ptr, int delta)
+static FORCE_INLINE int chunkRefCnt(HeapPages *pages, HeapPage *page, void *ptr, int delta)
 {
     HeapChunk *chunk = pageGetChunk(page, ptr);
 
@@ -508,8 +754,9 @@ static FORCE_INLINE int chunkChangeRefCnt(HeapPages *pages, HeapPage *page, void
     chunk->refCnt += delta;
     page->refCnt += delta;
 
-    // Additional ref counts for a user-defined address interval (used for stack frames to detect escaping refs)
-    stackChangeFrameRefCnt(pages->fiber, pages, ptr, delta);
+    // Detect escaping refs
+    for (Fiber *fiber = pages->fiber; fiber; fiber = fiber->parent)
+        stackUpdateFrameRefCnt(fiber, pages, ptr, delta);
 
 #ifdef UMKA_REF_CNT_DEBUG
     fprintf(stderr, "%p: delta: %+d  chunk: %d  page: %d\n", ptr, delta, chunk->refCnt, page->refCnt);
@@ -517,7 +764,8 @@ static FORCE_INLINE int chunkChangeRefCnt(HeapPages *pages, HeapPage *page, void
 
     if (page->refCnt == 0)
     {
-        pageRemove(pages, page);
+        const bool blacklist = pageMayBeReferencedByTemporaries(pages, page);
+        pageRemove(pages, page, blacklist);
         return 0;
     }
 
@@ -525,87 +773,41 @@ static FORCE_INLINE int chunkChangeRefCnt(HeapPages *pages, HeapPage *page, void
 }
 
 
-static FORCE_INLINE void candidateInit(RefCntChangeCandidates *candidates, Storage *storage)
-{
-    candidates->storage = storage;
-    candidates->capacity = 100;
-    candidates->stack = storageAdd(candidates->storage, candidates->capacity * sizeof(RefCntChangeCandidate));
-    candidates->top = -1;
-}
-
-
-static FORCE_INLINE void candidateReset(RefCntChangeCandidates *candidates)
-{
-    candidates->top = -1;
-}
-
-
-static FORCE_INLINE void candidatePush(RefCntChangeCandidates *candidates, void *ptr, const Type *type)
-{
-    if (candidates->top >= candidates->capacity - 1)
-    {
-        candidates->capacity *= 2;
-        candidates->stack = storageRealloc(candidates->storage, candidates->stack, candidates->capacity * sizeof(RefCntChangeCandidate));
-    }
-
-    RefCntChangeCandidate *candidate = &candidates->stack[++candidates->top];
-    candidate->ptr = ptr;
-    candidate->type = type;
-    candidate->pageForDeferred = NULL;
-}
-
-
-static FORCE_INLINE void candidatePushDeferred(RefCntChangeCandidates *candidates, void *ptr, const Type *type, HeapPage *page)
-{
-    candidatePush(candidates, ptr, type);
-    candidates->stack[candidates->top].pageForDeferred = page;
-}
-
-
-static FORCE_INLINE void candidatePop(RefCntChangeCandidates *candidates, void **ptr, const Type **type, HeapPage **page)
-{
-    RefCntChangeCandidate *candidate = &candidates->stack[candidates->top--];
-    *ptr = candidate->ptr;
-    *type = candidate->type;
-    *page = candidate->pageForDeferred;
-}
-
-
 // Helper functions
 
-static FORCE_INLINE int fsgetc(bool string, void *stream, int *len)
+static FORCE_INLINE int fsgetc(FILE *file, char *string, int *len)
 {
-    int ch = string ? ((char *)stream)[*len] : fgetc((FILE *)stream);
+    const int ch = string ? string[*len] : fgetc(file);
     (*len)++;
     return ch;
 }
 
 
-static int fsnprintf(bool string, void *stream, int size, const char *format, ...)
+static int fsnprintf(FILE *file, char *string, int size, const char *format, ...)
 {
     va_list args;
     va_start(args, format);
 
-    int res = string ? vsnprintf((char *)stream, size, format, args) : vfprintf((FILE *)stream, format, args);
+    const int res = string ? vsnprintf(string, size, format, args) : vfprintf(file, format, args);
 
     va_end(args);
     return res;
 }
 
 
-static int fsscanf(bool string, void *stream, const char *format, ...)
+static int fsscanf(FILE *file, char *string, const char *format, ...)
 {
     va_list args;
     va_start(args, format);
 
-    int res = string ? vsscanf((char *)stream, format, args) : vfscanf((FILE *)stream, format, args);
+    int res = string ? vsscanf(string, format, args) : vfscanf(file, format, args);
 
     va_end(args);
     return res;
 }
 
 
-static FORCE_INLINE char *fsscanfString(Storage *storage, bool string, void *stream, int *len)
+static FORCE_INLINE char *fsscanfString(Storage *storage, FILE *file, char *string, int *len)
 {
     int capacity = 8;
     char *str = storageAdd(storage, capacity);
@@ -616,7 +818,7 @@ static FORCE_INLINE char *fsscanfString(Storage *storage, bool string, void *str
 
     // Skip whitespace
     while (isspace(ch))
-        ch = fsgetc(string, stream, len);
+        ch = fsgetc(file, string, len);
 
     // Read string
     while (ch && ch != EOF && !isspace(ch))
@@ -627,7 +829,7 @@ static FORCE_INLINE char *fsscanfString(Storage *storage, bool string, void *str
             capacity *= 2;
             str = storageRealloc(storage, str, capacity);
         }
-        ch = fsgetc(string, stream, len);
+        ch = fsgetc(file, string, len);
     }
 
     str[writtenLen] = '\0';
@@ -690,17 +892,14 @@ void vmInit(VM *vm, Storage *storage, int stackSize, bool fileSystemEnabled, Err
     vm->storage = storage;
     vm->fiber = vm->mainFiber = storageAdd(vm->storage, sizeof(Fiber));
     vm->fiber->parent = NULL;
-    vm->fiber->refCntChangeCandidates = &vm->refCntChangeCandidates;
     vm->fiber->vm = vm;
     vm->fiber->alive = true;
     vm->fiber->fileSystemEnabled = fileSystemEnabled;
 
-    pageInit(&vm->pages, vm->fiber, error);
+    pageInit(&vm->pages, vm->fiber, vm->storage, error);
 
     vm->fiber->stack = chunkAlloc(&vm->pages, stackSize * sizeof(Slot), NULL, NULL, true, error);
     vm->fiber->stackSize = stackSize;
-
-    candidateInit(&vm->refCntChangeCandidates, vm->storage);
 
     memset(&vm->hooks, 0, sizeof(vm->hooks));
     vm->terminatedNormally = false;
@@ -716,8 +915,8 @@ void vmFree(VM *vm)
     if (UNLIKELY(!page))
        vm->error->runtimeHandler(vm->error->context, ERR_RUNTIME, "No fiber stack");
 
-    chunkChangeRefCnt(&vm->pages, page, vm->mainFiber->stack, -1);
-    pageFree(&vm->pages, vm->terminatedNormally);
+    chunkRefCnt(&vm->pages, page, vm->mainFiber->stack, -1);
+    pageFree(&vm->pages, vm->storage);
 }
 
 
@@ -961,9 +1160,9 @@ static int64_t doCompare(Slot lhs, Slot rhs, const Type *type, Error *error)
 }
 
 
-static FORCE_INLINE void doAddPtrBaseRefCntCandidate(RefCntChangeCandidates *candidates, void *ptr, const Type *type)
+static FORCE_INLINE void doAddPtrBaseRefCntCandidate(RefCntCandidates *candidates, void *ptr, const Type *type)
 {
-    if (typeKindGarbageCollected(type->base->kind))
+    if (type->base->isGarbageCollected)
     {
         void *data = ptr;
         if (type->base->kind == TYPE_PTR || type->base->kind == TYPE_STR || type->base->kind == TYPE_FIBER)
@@ -974,9 +1173,9 @@ static FORCE_INLINE void doAddPtrBaseRefCntCandidate(RefCntChangeCandidates *can
 }
 
 
-static FORCE_INLINE void doAddArrayItemsRefCntCandidates(RefCntChangeCandidates *candidates, void *ptr, const Type *type, int len)
+static FORCE_INLINE void doAddArrayItemsRefCntCandidates(RefCntCandidates *candidates, void *ptr, const Type *type, int len)
 {
-    if (typeKindGarbageCollected(type->base->kind))
+    if (type->base->isGarbageCollected)
     {
         char *itemPtr = ptr;
         const int itemSize = type->base->size;
@@ -994,11 +1193,11 @@ static FORCE_INLINE void doAddArrayItemsRefCntCandidates(RefCntChangeCandidates 
 }
 
 
-static FORCE_INLINE void doAddStructFieldsRefCntCandidates(RefCntChangeCandidates *candidates, void *ptr, const Type *type)
+static FORCE_INLINE void doAddStructFieldsRefCntCandidates(RefCntCandidates *candidates, void *ptr, const Type *type)
 {
     for (int i = 0; i < type->numItems; i++)
     {
-        if (typeKindGarbageCollected(type->field[i]->type->kind))
+        if (type->field[i]->type->isGarbageCollected)
         {
             void *field = (char *)ptr + type->field[i]->offset;
             if (type->field[i]->type->kind == TYPE_PTR || type->field[i]->type->kind == TYPE_STR || type->field[i]->type->kind == TYPE_FIBER)
@@ -1010,13 +1209,13 @@ static FORCE_INLINE void doAddStructFieldsRefCntCandidates(RefCntChangeCandidate
 }
 
 
-static FORCE_INLINE void doChangeRefCntImpl(Fiber *fiber, HeapPages *pages, void *ptr, const Type *type, TokenKind tokKind)
+static void doRefCntImpl(HeapPages *pages, void *ptr, const Type *type, TokenKind tokKind)
 {
     // Update ref counts for pointers (including static/dynamic array items and structure/interface fields) if allocated dynamically
     // All garbage collected composite types are represented by pointers by default
     // RTTI is required for lists, trees, etc., since the propagation depth for the root ref count is unknown at compile time
 
-    RefCntChangeCandidates *candidates = fiber->refCntChangeCandidates;
+    RefCntCandidates *candidates = &pages->refCntCandidates;
     candidateReset(candidates);
     candidatePush(candidates, ptr, type);
 
@@ -1028,7 +1227,7 @@ static FORCE_INLINE void doChangeRefCntImpl(Fiber *fiber, HeapPages *pages, void
         // Process deferred ref count updates first (the heap page should have been memoized for them)
         if (pageForDeferred)
         {
-            chunkChangeRefCnt(pages, pageForDeferred, ptr, (tokKind == TOK_PLUSPLUS) ? 1 : -1);
+            chunkRefCnt(pages, pageForDeferred, ptr, (tokKind == TOK_PLUSPLUS) ? 1 : -1);
             continue;
         }
 
@@ -1042,13 +1241,13 @@ static FORCE_INLINE void doChangeRefCntImpl(Fiber *fiber, HeapPages *pages, void
                     break;
 
                 if (tokKind == TOK_PLUSPLUS)
-                    chunkChangeRefCnt(pages, page, ptr, 1);
+                    chunkRefCnt(pages, page, ptr, 1);
                 else
                 {
                     HeapChunk *chunk = pageGetChunk(page, ptr);
                     if (chunk->refCnt > 1)
                     {
-                        chunkChangeRefCnt(pages, page, ptr, -1);
+                        chunkRefCnt(pages, page, ptr, -1);
                         break;
                     }
 
@@ -1099,7 +1298,7 @@ static FORCE_INLINE void doChangeRefCntImpl(Fiber *fiber, HeapPages *pages, void
                 if (!page)
                     break;
 
-                chunkChangeRefCnt(pages, page, ptr, (tokKind == TOK_PLUSPLUS) ? 1 : -1);
+                chunkRefCnt(pages, page, ptr, (tokKind == TOK_PLUSPLUS) ? 1 : -1);
                 break;
             }
 
@@ -1117,13 +1316,13 @@ static FORCE_INLINE void doChangeRefCntImpl(Fiber *fiber, HeapPages *pages, void
                     break;
 
                 if (tokKind == TOK_PLUSPLUS)
-                    chunkChangeRefCnt(pages, page, array->data, 1);
+                    chunkRefCnt(pages, page, array->data, 1);
                 else
                 {
                     const HeapChunk *chunk = pageGetChunk(page, array->data);
                     if (chunk->refCnt > 1)
                     {
-                        chunkChangeRefCnt(pages, page, array->data, -1);
+                        chunkRefCnt(pages, page, array->data, -1);
                         break;
                     }
 
@@ -1168,13 +1367,13 @@ static FORCE_INLINE void doChangeRefCntImpl(Fiber *fiber, HeapPages *pages, void
                     break;
 
                 if (tokKind == TOK_PLUSPLUS)
-                    chunkChangeRefCnt(pages, page, ptr, 1);
+                    chunkRefCnt(pages, page, ptr, 1);
                 else
                 {
                     const HeapChunk *chunk = pageGetChunk(page, ptr);
                     if (chunk->refCnt > 1)
                     {
-                        chunkChangeRefCnt(pages, page, ptr, -1);
+                        chunkRefCnt(pages, page, ptr, -1);
                         break;
                     }
 
@@ -1186,8 +1385,8 @@ static FORCE_INLINE void doChangeRefCntImpl(Fiber *fiber, HeapPages *pages, void
                     if (UNLIKELY(!stackPage))
                         pages->error->runtimeHandler(pages->error->context, ERR_RUNTIME, "No fiber stack");
 
-                    chunkChangeRefCnt(pages, stackPage, ((Fiber *)ptr)->stack, -1);
-                    chunkChangeRefCnt(pages, page, ptr, -1);
+                    chunkRefCnt(pages, stackPage, ((Fiber *)ptr)->stack, -1);
+                    chunkRefCnt(pages, page, ptr, -1);
                 }
                 break;
             }
@@ -1353,8 +1552,8 @@ static MapNode *doCopyMapNode(Map *map, MapNode *node, Fiber *fiber, HeapPages *
         // When allocating dynamic arrays, we mark with type the data chunk, not the header chunk
         result->key = chunkAlloc(pages, keyType->size, keyType->kind == TYPE_DYNARRAY ? NULL : keyType, NULL, false, error);
 
-        if (typeGarbageCollected(keyType))
-            doChangeRefCntImpl(fiber, pages, srcKey.ptrVal, keyType, TOK_PLUSPLUS);
+        if (keyType->isGarbageCollected)
+            doRefCntImpl(pages, srcKey.ptrVal, keyType, TOK_PLUSPLUS);
 
         doAssignImpl(result->key, srcKey, keyType->kind, keyType->size, error);
     }
@@ -1369,8 +1568,8 @@ static MapNode *doCopyMapNode(Map *map, MapNode *node, Fiber *fiber, HeapPages *
         // When allocating dynamic arrays, we mark with type the data chunk, not the header chunk
         result->data = chunkAlloc(pages, itemType->size, itemType->kind == TYPE_DYNARRAY ? NULL : itemType, NULL, false, error);
 
-        if (typeGarbageCollected(itemType))
-            doChangeRefCntImpl(fiber, pages, srcItem.ptrVal, itemType, TOK_PLUSPLUS);
+        if (itemType->isGarbageCollected)
+            doRefCntImpl(pages, srcItem.ptrVal, itemType, TOK_PLUSPLUS);
 
         doAssignImpl(result->data, srcItem, itemType->kind, itemType->size, error);
     }
@@ -1430,12 +1629,12 @@ static FORCE_INLINE Fiber *doAllocFiber(Fiber *parent, const Closure *childClosu
 
     child->parent = parent;
 
-    const Signature *childClosureSig = &childClosureType->field[0]->type->sig;
+    const Signature *childClosureSig = childClosureType->field[0]->type->sig;
 
     // Push upvalues
     child->top -= sizeof(Interface) / sizeof(Slot);
     *(Interface *)child->top = childClosure->upvalue;
-    doChangeRefCntImpl(child, pages, child->top, childClosureSig->param[0]->type, TOK_PLUSPLUS);
+    doRefCntImpl(pages, child->top, childClosureSig->param[0]->type, TOK_PLUSPLUS);
 
     // Push 'return from fiber' signal instead of return address
     (--child->top)->intVal = RETURN_FROM_FIBER;
@@ -1459,9 +1658,9 @@ static FORCE_INLINE int doPrintIndented(char *buf, int maxLen, int depth, bool p
         case '[':
         case '{':
         {
-            len += snprintf(buf + len, maxLen, "%c", ch);
+            len += snprintf(nonnull(buf, len), maxLen, "%c", ch);
             if (pretty)
-                len += snprintf(buf + len, maxLen, "\n%*c", INDENT_WIDTH * (depth + 1), ' ');
+                len += snprintf(nonnull(buf, len), maxLen, "\n%*c", INDENT_WIDTH * (depth + 1), ' ');
             break;
         }
 
@@ -1472,20 +1671,20 @@ static FORCE_INLINE int doPrintIndented(char *buf, int maxLen, int depth, bool p
             if (pretty)
             {
                 if (depth > 0)
-                    len += snprintf(buf + len, maxLen, "\n%*c", INDENT_WIDTH * depth, ' ');
+                    len += snprintf(nonnull(buf, len), maxLen, "\n%*c", INDENT_WIDTH * depth, ' ');
                 else
-                    len += snprintf(buf + len, maxLen, "\n");
+                    len += snprintf(nonnull(buf, len), maxLen, "\n");
             }
-            len += snprintf(buf + len, maxLen, "%c", ch);
+            len += snprintf(nonnull(buf, len), maxLen, "%c", ch);
             break;
         }
 
         case ' ':
         {
             if (pretty)
-                len += snprintf(buf + len, maxLen, "\n%*c", INDENT_WIDTH * (depth + 1), ' ');
+                len += snprintf(nonnull(buf, len), maxLen, "\n%*c", INDENT_WIDTH * (depth + 1), ' ');
             else
-                len += snprintf(buf + len, maxLen, " ");
+                len += snprintf(nonnull(buf, len), maxLen, " ");
             break;
         }
 
@@ -1504,56 +1703,56 @@ static int doFillReprBuf(const Slot *slot, const Type *type, char *buf, int maxL
 
     if (depth == MAX_DEPTH)
     {
-        len += snprintf(buf + len, maxLen, "...");
+        len += snprintf(nonnull(buf, len), maxLen, "...");
         return len;
     }
 
     switch (type->kind)
     {
-        case TYPE_VOID:     len += snprintf(buf + len, maxLen, "void");                                                             break;
+        case TYPE_VOID:     len += snprintf(nonnull(buf, len), maxLen, "void");                                                             break;
         case TYPE_INT8:
         case TYPE_INT16:
         case TYPE_INT32:
         case TYPE_INT:
         case TYPE_UINT8:
         case TYPE_UINT16:
-        case TYPE_UINT32:   len += snprintf(buf + len, maxLen, "%lld", (long long int)slot->intVal);                                break;
-        case TYPE_UINT:     len += snprintf(buf + len, maxLen, "%llu", (unsigned long long int)slot->uintVal);                      break;
-        case TYPE_BOOL:     len += snprintf(buf + len, maxLen, slot->intVal ? "true" : "false");                                    break;
+        case TYPE_UINT32:   len += snprintf(nonnull(buf, len), maxLen, "%lld", (long long int)slot->intVal);                                break;
+        case TYPE_UINT:     len += snprintf(nonnull(buf, len), maxLen, "%llu", (unsigned long long int)slot->uintVal);                      break;
+        case TYPE_BOOL:     len += snprintf(nonnull(buf, len), maxLen, slot->intVal ? "true" : "false");                                    break;
         case TYPE_CHAR:
         {
             const char *format = (unsigned char)slot->intVal >= ' ' ? "'%c'" : "0x%02X";
-            len += snprintf(buf + len, maxLen, format, (unsigned char)slot->intVal);
+            len += snprintf(nonnull(buf, len), maxLen, format, (unsigned char)slot->intVal);
             break;
         }
         case TYPE_REAL32:
-        case TYPE_REAL:     len += snprintf(buf + len, maxLen, "%lg", slot->realVal);                                               break;
+        case TYPE_REAL:     len += snprintf(nonnull(buf, len), maxLen, "%lg", slot->realVal);                                               break;
         case TYPE_PTR:
         {
-            len += snprintf(buf + len, maxLen, "%p", slot->ptrVal);
+            len += snprintf(nonnull(buf, len), maxLen, "%p", slot->ptrVal);
 
             if (dereferenced && slot->ptrVal && type->base->kind != TYPE_VOID)
             {
                 Slot dataSlot = {.ptrVal = slot->ptrVal};
                 doDerefImpl(&dataSlot, type->base->kind, error);
 
-                len += snprintf(buf + len, maxLen, " -> ");
-                len += doPrintIndented(buf + len, maxLen, depth, pretty, '(');
-                len += doFillReprBuf(&dataSlot, type->base, buf + len, maxLen, depth + 1, pretty, dereferenced, storage, error);
-                len += doPrintIndented(buf + len, maxLen, depth, pretty, ')');
+                len += snprintf(nonnull(buf, len), maxLen, " -> ");
+                len += doPrintIndented(nonnull(buf, len), maxLen, depth, pretty, '(');
+                len += doFillReprBuf(&dataSlot, type->base, nonnull(buf, len), maxLen, depth + 1, pretty, dereferenced, storage, error);
+                len += doPrintIndented(nonnull(buf, len), maxLen, depth, pretty, ')');
             }
             break;
         }
-        case TYPE_WEAKPTR:  len += snprintf(buf + len, maxLen, "%llx", (unsigned long long int)slot->weakPtrVal);                   break;
+        case TYPE_WEAKPTR:  len += snprintf(nonnull(buf, len), maxLen, "%llx", (unsigned long long int)slot->weakPtrVal);                   break;
         case TYPE_STR:
         {
             doCheckStr((char *)slot->ptrVal, error);
-            len += snprintf(buf + len, maxLen, "\"%s\"", slot->ptrVal ? (char *)slot->ptrVal : "");
+            len += snprintf(nonnull(buf, len), maxLen, "\"%s\"", slot->ptrVal ? (char *)slot->ptrVal : "");
             break;
         }
         case TYPE_ARRAY:
         {
-            len += doPrintIndented(buf + len, maxLen, depth, pretty, '[');
+            len += doPrintIndented(nonnull(buf, len), maxLen, depth, pretty, '[');
 
             char *itemPtr = slot->ptrVal;
             const int itemSize = type->base->size;
@@ -1562,21 +1761,21 @@ static int doFillReprBuf(const Slot *slot, const Type *type, char *buf, int maxL
             {
                 Slot itemSlot = {.ptrVal = itemPtr};
                 doDerefImpl(&itemSlot, type->base->kind, error);
-                len += doFillReprBuf(&itemSlot, type->base, buf + len, maxLen, depth + 1, pretty, dereferenced, storage, error);
+                len += doFillReprBuf(&itemSlot, type->base, nonnull(buf, len), maxLen, depth + 1, pretty, dereferenced, storage, error);
 
                 if (i < type->numItems - 1)
-                    len += doPrintIndented(buf + len, maxLen, depth, pretty, ' ');
+                    len += doPrintIndented(nonnull(buf, len), maxLen, depth, pretty, ' ');
 
                 itemPtr += itemSize;
             }
 
-            len += doPrintIndented(buf + len, maxLen, depth, pretty, ']');
+            len += doPrintIndented(nonnull(buf, len), maxLen, depth, pretty, ']');
             break;
         }
 
         case TYPE_DYNARRAY:
         {
-            len += doPrintIndented(buf + len, maxLen, depth, pretty, '[');
+            len += doPrintIndented(nonnull(buf, len), maxLen, depth, pretty, '[');
 
             const DynArray *array = slot->ptrVal;
             if (array && array->data)
@@ -1586,22 +1785,22 @@ static int doFillReprBuf(const Slot *slot, const Type *type, char *buf, int maxL
                 {
                     Slot itemSlot = {.ptrVal = itemPtr};
                     doDerefImpl(&itemSlot, type->base->kind, error);
-                    len += doFillReprBuf(&itemSlot, type->base, buf + len, maxLen, depth + 1, pretty, dereferenced, storage, error);
+                    len += doFillReprBuf(&itemSlot, type->base, nonnull(buf, len), maxLen, depth + 1, pretty, dereferenced, storage, error);
 
                     if (i < getDims(array)->len - 1)
-                        len += doPrintIndented(buf + len, maxLen, depth, pretty, ' ');
+                        len += doPrintIndented(nonnull(buf, len), maxLen, depth, pretty, ' ');
 
                     itemPtr += array->itemSize;
                 }
             }
 
-            len += doPrintIndented(buf + len, maxLen, depth, pretty, ']');
+            len += doPrintIndented(nonnull(buf, len), maxLen, depth, pretty, ']');
             break;
         }
 
         case TYPE_MAP:
         {
-            len += doPrintIndented(buf + len, maxLen, depth, pretty, '{');
+            len += doPrintIndented(nonnull(buf, len), maxLen, depth, pretty, '{');
 
             Map *map = slot->ptrVal;
             if (map && map->root)
@@ -1618,9 +1817,9 @@ static int doFillReprBuf(const Slot *slot, const Type *type, char *buf, int maxL
                 {
                     Slot keySlot = {.ptrVal = keyPtr};
                     doDerefImpl(&keySlot, keyType->kind, error);
-                    len += doFillReprBuf(&keySlot, keyType, buf + len, maxLen, depth + 1, pretty, dereferenced, storage, error);
+                    len += doFillReprBuf(&keySlot, keyType, nonnull(buf, len), maxLen, depth + 1, pretty, dereferenced, storage, error);
 
-                    len += snprintf(buf + len, maxLen, ": ");
+                    len += snprintf(nonnull(buf, len), maxLen, ": ");
 
                     const MapNode *node = *doGetMapNode(map, keySlot, false, NULL, error);
                     if (UNLIKELY(!node))
@@ -1628,10 +1827,10 @@ static int doFillReprBuf(const Slot *slot, const Type *type, char *buf, int maxL
 
                     Slot itemSlot = {.ptrVal = node->data};
                     doDerefImpl(&itemSlot, itemType->kind, error);
-                    len += doFillReprBuf(&itemSlot, itemType, buf + len, maxLen, depth + 1, pretty, dereferenced, storage, error);
+                    len += doFillReprBuf(&itemSlot, itemType, nonnull(buf, len), maxLen, depth + 1, pretty, dereferenced, storage, error);
 
                     if (i < map->root->len - 1)
-                        len += doPrintIndented(buf + len, maxLen, depth, pretty, ' ');
+                        len += doPrintIndented(nonnull(buf, len), maxLen, depth, pretty, ' ');
 
                     keyPtr += keyType->size;
                 }
@@ -1639,7 +1838,7 @@ static int doFillReprBuf(const Slot *slot, const Type *type, char *buf, int maxL
                 storageRemove(storage, keys);
             }
 
-            len += doPrintIndented(buf + len, maxLen, depth, pretty, '}');
+            len += doPrintIndented(nonnull(buf, len), maxLen, depth, pretty, '}');
             break;
         }
 
@@ -1647,7 +1846,7 @@ static int doFillReprBuf(const Slot *slot, const Type *type, char *buf, int maxL
         case TYPE_STRUCT:
         case TYPE_CLOSURE:
         {
-            len += doPrintIndented(buf + len, maxLen, depth, pretty, '{');
+            len += doPrintIndented(nonnull(buf, len), maxLen, depth, pretty, '{');
 
             bool skipNames = typeExprListStruct(type);
 
@@ -1656,14 +1855,14 @@ static int doFillReprBuf(const Slot *slot, const Type *type, char *buf, int maxL
                 Slot fieldSlot = {.ptrVal = (char *)slot->ptrVal + type->field[i]->offset};
                 doDerefImpl(&fieldSlot, type->field[i]->type->kind, error);
                 if (!skipNames)
-                    len += snprintf(buf + len, maxLen, "%s: ", type->field[i]->name);
-                len += doFillReprBuf(&fieldSlot, type->field[i]->type, buf + len, maxLen, depth + 1, pretty, dereferenced, storage, error);
+                    len += snprintf(nonnull(buf, len), maxLen, "%s: ", type->field[i]->name);
+                len += doFillReprBuf(&fieldSlot, type->field[i]->type, nonnull(buf, len), maxLen, depth + 1, pretty, dereferenced, storage, error);
 
                 if (i < type->numItems - 1)
-                    len += doPrintIndented(buf + len, maxLen, depth, pretty, ' ');
+                    len += doPrintIndented(nonnull(buf, len), maxLen, depth, pretty, ' ');
             }
 
-            len += doPrintIndented(buf + len, maxLen, depth, pretty, '}');
+            len += doPrintIndented(nonnull(buf, len), maxLen, depth, pretty, '}');
             break;
         }
 
@@ -1678,22 +1877,22 @@ static int doFillReprBuf(const Slot *slot, const Type *type, char *buf, int maxL
                 if (pretty)
                 {
                     char selfTypeBuf[DEFAULT_STR_LEN + 1];
-                    len += snprintf(buf + len, maxLen, "%s", typeSpelling(interface->selfType->base, selfTypeBuf));
-                    len += doPrintIndented(buf + len, maxLen, depth, pretty, '(');
+                    len += snprintf(nonnull(buf, len), maxLen, "%s", typeSpelling(interface->selfType->base, selfTypeBuf));
+                    len += doPrintIndented(nonnull(buf, len), maxLen, depth, pretty, '(');
                 }
 
-                len += doFillReprBuf(&selfSlot, interface->selfType->base, buf + len, maxLen, depth + 1, pretty, dereferenced, storage, error);
+                len += doFillReprBuf(&selfSlot, interface->selfType->base, nonnull(buf, len), maxLen, depth + 1, pretty, dereferenced, storage, error);
 
                 if (pretty)
-                    len += doPrintIndented(buf + len, maxLen, depth, pretty, ')');
+                    len += doPrintIndented(nonnull(buf, len), maxLen, depth, pretty, ')');
             }
             else
-                len += snprintf(buf + len, maxLen, "null");
+                len += snprintf(nonnull(buf, len), maxLen, "null");
             break;
         }
 
-        case TYPE_FIBER:    len += snprintf(buf + len, maxLen, "fiber @ %p", slot->ptrVal);                break;
-        case TYPE_FN:       len += snprintf(buf + len, maxLen, "fn @ %lld", (long long int)slot->intVal);  break;
+        case TYPE_FIBER:    len += snprintf(nonnull(buf, len), maxLen, "fiber @ %p", slot->ptrVal);                break;
+        case TYPE_FN:       len += snprintf(nonnull(buf, len), maxLen, "fn @ %lld", (long long int)slot->intVal);  break;
         default:            break;
     }
 
@@ -1701,29 +1900,29 @@ static int doFillReprBuf(const Slot *slot, const Type *type, char *buf, int maxL
 }
 
 
-static FORCE_INLINE int doPrintSlot(bool string, void *stream, int maxLen, const char *format, Slot slot, TypeKind typeKind, Error *error)
+static FORCE_INLINE int doPrintSlot(FILE *file, char *string, int maxLen, const char *format, Slot slot, TypeKind typeKind, Error *error)
 {
     int len = -1;
 
     switch (typeKind)
     {
-        case TYPE_VOID:         len = fsnprintf(string, stream, maxLen, format);                               break;
-        case TYPE_INT8:         len = fsnprintf(string, stream, maxLen, format, (int8_t        )slot.intVal);  break;
-        case TYPE_INT16:        len = fsnprintf(string, stream, maxLen, format, (int16_t       )slot.intVal);  break;
-        case TYPE_INT32:        len = fsnprintf(string, stream, maxLen, format, (int32_t       )slot.intVal);  break;
-        case TYPE_INT:          len = fsnprintf(string, stream, maxLen, format,                 slot.intVal);  break;
-        case TYPE_UINT8:        len = fsnprintf(string, stream, maxLen, format, (uint8_t       )slot.intVal);  break;
-        case TYPE_UINT16:       len = fsnprintf(string, stream, maxLen, format, (uint16_t      )slot.intVal);  break;
-        case TYPE_UINT32:       len = fsnprintf(string, stream, maxLen, format, (uint32_t      )slot.intVal);  break;
-        case TYPE_UINT:         len = fsnprintf(string, stream, maxLen, format,                 slot.uintVal); break;
-        case TYPE_BOOL:         len = fsnprintf(string, stream, maxLen, format, (bool          )slot.intVal);  break;
-        case TYPE_CHAR:         len = fsnprintf(string, stream, maxLen, format, (unsigned char )slot.intVal);  break;
+        case TYPE_VOID:         len = fsnprintf(file, string, maxLen, format);                               break;
+        case TYPE_INT8:         len = fsnprintf(file, string, maxLen, format, (int8_t        )slot.intVal);  break;
+        case TYPE_INT16:        len = fsnprintf(file, string, maxLen, format, (int16_t       )slot.intVal);  break;
+        case TYPE_INT32:        len = fsnprintf(file, string, maxLen, format, (int32_t       )slot.intVal);  break;
+        case TYPE_INT:          len = fsnprintf(file, string, maxLen, format,                 slot.intVal);  break;
+        case TYPE_UINT8:        len = fsnprintf(file, string, maxLen, format, (uint8_t       )slot.intVal);  break;
+        case TYPE_UINT16:       len = fsnprintf(file, string, maxLen, format, (uint16_t      )slot.intVal);  break;
+        case TYPE_UINT32:       len = fsnprintf(file, string, maxLen, format, (uint32_t      )slot.intVal);  break;
+        case TYPE_UINT:         len = fsnprintf(file, string, maxLen, format,                 slot.uintVal); break;
+        case TYPE_BOOL:         len = fsnprintf(file, string, maxLen, format, (bool          )slot.intVal);  break;
+        case TYPE_CHAR:         len = fsnprintf(file, string, maxLen, format, (unsigned char )slot.intVal);  break;
         case TYPE_REAL32:
-        case TYPE_REAL:         len = fsnprintf(string, stream, maxLen, format,                 slot.realVal); break;
+        case TYPE_REAL:         len = fsnprintf(file, string, maxLen, format,                 slot.realVal); break;
         case TYPE_STR:
         {
             doCheckStr((char *)slot.ptrVal, error);
-            len = fsnprintf(string, stream, maxLen, format, slot.ptrVal ? (char *)slot.ptrVal : "");
+            len = fsnprintf(file, string, maxLen, format, slot.ptrVal ? (char *)slot.ptrVal : "");
             break;
         }
         default:                error->runtimeHandler(error->context, ERR_RUNTIME, "Illegal type"); break;
@@ -1742,21 +1941,40 @@ enum
 };
 
 
-static FORCE_INLINE void doBuiltinPrintf(Fiber *fiber, HeapPages *pages, bool console, bool string, Error *error)
+static FORCE_INLINE void doBuiltinPrintf(Fiber *fiber, HeapPages *pages, bool isConsole, bool isString, Error *error)
 {
-    const int prevLen  = fiber->top[STACK_OFFSET_COUNT].intVal;
-    void *stream       = console ? stdout : fiber->top[STACK_OFFSET_STREAM].ptrVal;
-    const char *format = (const char *)fiber->top[STACK_OFFSET_FORMAT].ptrVal;
-    Slot value         = fiber->top[STACK_OFFSET_VALUE];
+    FILE *file = NULL;
+    char *string = NULL;
+    if (isString)
+    {
+        string = fiber->top[STACK_OFFSET_STREAM].ptrVal;
+        if (!string)
+            string = doGetEmptyStr();
+    }
+    else if (isConsole)
+    {
+        file = stdout;
+    }
+    else if (fiber->fileSystemEnabled)
+    {
+        const File *umkaFile = fiber->top[STACK_OFFSET_STREAM].ptrVal;
+        if (umkaFile)
+            file = umkaFile->stream;
+    }
 
-    const Type *type   = fiber->code[fiber->ip].type;
-    TypeKind typeKind  = type->kind;
-
-    if (UNLIKELY(!string && (!stream || (!fiber->fileSystemEnabled && !console))))
+    if (UNLIKELY(!string && !file))
         error->runtimeHandler(error->context, ERR_RUNTIME, "printf destination is null");
 
+    const char *format = fiber->top[STACK_OFFSET_FORMAT].ptrVal;
     if (!format)
         format = doGetEmptyStr();
+
+    const int prevLen  = fiber->top[STACK_OFFSET_COUNT].intVal;
+
+    Slot value = fiber->top[STACK_OFFSET_VALUE];        
+
+    const Type *type = fiber->code[fiber->ip].type;
+    TypeKind typeKind = type->kind;
 
     int formatLen = -1, typeLetterPos = -1;
     TypeKind expectedTypeKind = TYPE_NONE;
@@ -1840,35 +2058,37 @@ static FORCE_INLINE void doBuiltinPrintf(Fiber *fiber, HeapPages *pages, bool co
     int len = 0;
     if (string)
     {
-        len = doPrintSlot(true, NULL, 0, curFormat, value, typeKind, error);
+        len = doPrintSlot(NULL, string, 0, curFormat, value, typeKind, error);
 
-        const bool inPlace = stream && getStrDims(stream)->capacity >= prevLen + len + 1;
+        const bool inPlace = getStrDims(string)->capacity >= prevLen + len + 1;
         if (inPlace)
         {
-            getStrDims(stream)->len = prevLen + len;
+            getStrDims(string)->len = prevLen + len;
         }
         else
         {
-            char *newStream = doAllocStr(pages, prevLen + len, error);
-            if (stream)
-                memcpy(newStream, stream, prevLen);
-            newStream[prevLen] = 0;
+            char *newString = doAllocStr(pages, prevLen + len, error);
+            memcpy(newString, string, prevLen);
+            newString[prevLen] = 0;
 
             // Decrease old string ref count
-            Type strType = {.kind = TYPE_STR};
-            doChangeRefCntImpl(fiber, pages, stream, &strType, TOK_MINUSMINUS);
+            const Type strType = {.kind = TYPE_STR};
+            doRefCntImpl(pages, string, &strType, TOK_MINUSMINUS);
 
-            stream = newStream;
+            string = newString;
         }
 
-        len = doPrintSlot(true, (char *)stream + prevLen, len + 1, curFormat, value, typeKind, error);
+        len = doPrintSlot(NULL, string + prevLen, len + 1, curFormat, value, typeKind, error);
     }
     else
-        len = doPrintSlot(false, stream, INT_MAX, curFormat, value, typeKind, error);
+    {
+        len = doPrintSlot(file, NULL, INT_MAX, curFormat, value, typeKind, error);
+    }
 
     fiber->top[STACK_OFFSET_FORMAT].ptrVal = (char *)fiber->top[STACK_OFFSET_FORMAT].ptrVal + formatLen;
     fiber->top[STACK_OFFSET_COUNT].intVal += len;
-    fiber->top[STACK_OFFSET_STREAM].ptrVal = stream;
+    if (isString)
+        fiber->top[STACK_OFFSET_STREAM].ptrVal = string;
 
     fiber->top++;   // Remove value
 
@@ -1880,20 +2100,36 @@ static FORCE_INLINE void doBuiltinPrintf(Fiber *fiber, HeapPages *pages, bool co
 }
 
 
-static FORCE_INLINE void doBuiltinScanf(Fiber *fiber, HeapPages *pages, bool console, bool string, Error *error)
+static FORCE_INLINE void doBuiltinScanf(Fiber *fiber, HeapPages *pages, bool isConsole, bool isString, Error *error)
 {
-    void *stream       = console ? stdin : (void *)fiber->top[STACK_OFFSET_STREAM].ptrVal;
-    const char *format = (const char *)fiber->top[STACK_OFFSET_FORMAT].ptrVal;
-    Slot value         = fiber->top[STACK_OFFSET_VALUE];
+    FILE *file = NULL;
+    char *string = NULL;
+    if (isString)
+    {
+        string = fiber->top[STACK_OFFSET_STREAM].ptrVal;
+    }
+    else if (isConsole)
+    {
+        file = stdin;
+    }
+    else if (fiber->fileSystemEnabled)
+    {
+        const File *umkaFile = fiber->top[STACK_OFFSET_STREAM].ptrVal;
+        if (umkaFile)
+            file = umkaFile->stream;
+    }
 
-    const Type *type   = fiber->code[fiber->ip].type;
-    TypeKind typeKind  = type->kind;
-
-    if (UNLIKELY(!stream || (!fiber->fileSystemEnabled && !console && !string)))
+    if (UNLIKELY(!string && !file))
         error->runtimeHandler(error->context, ERR_RUNTIME, "scanf source is null");
-
+        
+    const char *format = fiber->top[STACK_OFFSET_FORMAT].ptrVal;
     if (!format)
         format = doGetEmptyStr();
+
+    Slot value = fiber->top[STACK_OFFSET_VALUE];        
+
+    const Type *type = fiber->code[fiber->ip].type;
+    TypeKind typeKind = type->kind;
 
     int formatLen = -1, typeLetterPos = -1;
     TypeKind expectedTypeKind = TYPE_NONE;
@@ -1920,7 +2156,9 @@ static FORCE_INLINE void doBuiltinScanf(Fiber *fiber, HeapPages *pages, bool con
     int len = 0, cnt = 0;
 
     if (typeKind == TYPE_VOID)
-        cnt = fsscanf(string, stream, curFormat, &len);
+    {
+        cnt = fsscanf(file, string, curFormat, &len);
+    }
     else
     {
         if (UNLIKELY(!value.ptrVal))
@@ -1929,12 +2167,12 @@ static FORCE_INLINE void doBuiltinScanf(Fiber *fiber, HeapPages *pages, bool con
         // Strings need special handling, as the required buffer size is unknown
         if (typeKind == TYPE_STR)
         {
-            char *src = fsscanfString(fiber->vm->storage, string, stream, &len);
+            char *src = fsscanfString(fiber->vm->storage, file, string, &len);
             char **dest = (char **)value.ptrVal;
 
             // Decrease old string ref count
             Type destType = {.kind = TYPE_STR};
-            doChangeRefCntImpl(fiber, pages, *dest, &destType, TOK_MINUSMINUS);
+            doRefCntImpl(pages, *dest, &destType, TOK_MINUSMINUS);
 
             // Allocate new string
             *dest = doAllocStr(pages, strlen(src), error);
@@ -1944,12 +2182,14 @@ static FORCE_INLINE void doBuiltinScanf(Fiber *fiber, HeapPages *pages, bool con
             cnt = (*dest)[0] ? 1 : 0;
         }
         else
-            cnt = fsscanf(string, stream, curFormat, (void *)value.ptrVal, &len);
+        {
+            cnt = fsscanf(file, string, curFormat, (void *)value.ptrVal, &len);
+        }
     }
 
     fiber->top[STACK_OFFSET_FORMAT].ptrVal = (char *)fiber->top[STACK_OFFSET_FORMAT].ptrVal + formatLen;
     fiber->top[STACK_OFFSET_COUNT].intVal += cnt;
-    if (string)
+    if (isString)
         fiber->top[STACK_OFFSET_STREAM].ptrVal = (char *)fiber->top[STACK_OFFSET_STREAM].ptrVal + len;
 
     fiber->top++;   // Remove value
@@ -1959,19 +2199,13 @@ static FORCE_INLINE void doBuiltinScanf(Fiber *fiber, HeapPages *pages, bool con
 }
 
 
-// fn new(type: Type, size: int [, expr: type]): ^type
+// fn new(type: Type [, expr: type]): ^type
 static FORCE_INLINE void doBuiltinNew(Fiber *fiber, HeapPages *pages, Error *error)
 {
-    const int size = (fiber->top++)->intVal;
     const Type *type = fiber->code[fiber->ip].type;
 
     // For dynamic arrays, we mark with type the data chunk, not the header chunk
-    if (type && type->kind == TYPE_DYNARRAY)
-        type = NULL;
-
-    void *result = chunkAlloc(pages, size, type, NULL, false, error);
-
-    (--fiber->top)->ptrVal = result;
+    (--fiber->top)->ptrVal = chunkAlloc(pages, type->size, (type->kind == TYPE_DYNARRAY ? NULL : type), NULL, false, error); 
 }
 
 
@@ -2010,7 +2244,7 @@ static FORCE_INLINE void doBuiltinMake(Fiber *fiber, HeapPages *pages, Error *er
 
 
 // fn makefromarr(src: [...]ItemType, len: int): []ItemType
-static FORCE_INLINE void doBuiltinMakefromarr(Fiber *fiber, HeapPages *pages, Error *error)
+static FORCE_INLINE void doBuiltinMakeFromArr(Fiber *fiber, HeapPages *pages, Error *error)
 {
     DynArray *dest = (fiber->top++)->ptrVal;
     const int64_t len = (fiber->top++)->intVal;
@@ -2023,14 +2257,14 @@ static FORCE_INLINE void doBuiltinMakefromarr(Fiber *fiber, HeapPages *pages, Er
 
     // Increase result items' ref counts, as if they have been assigned one by one
     const Type staticArrayType = typeMakeDetachedArray(dest->type->base, getDims(dest)->len);
-    doChangeRefCntImpl(fiber, pages, dest->data, &staticArrayType, TOK_PLUSPLUS);
+    doRefCntImpl(pages, dest->data, &staticArrayType, TOK_PLUSPLUS);
 
     (--fiber->top)->ptrVal = dest;
 }
 
 
 // fn makefromstr(src: str): []char | []uint8
-static FORCE_INLINE void doBuiltinMakefromstr(Fiber *fiber, HeapPages *pages, Error *error)
+static FORCE_INLINE void doBuiltinMakeFromStr(Fiber *fiber, HeapPages *pages, Error *error)
 {
     DynArray *dest  = (fiber->top++)->ptrVal;
     const char *src = (fiber->top++)->ptrVal;
@@ -2047,8 +2281,8 @@ static FORCE_INLINE void doBuiltinMakefromstr(Fiber *fiber, HeapPages *pages, Er
 }
 
 
-// fn maketoarr(src: []ItemType): [...]ItemType
-static FORCE_INLINE void doBuiltinMaketoarr(Fiber *fiber, HeapPages *pages, Error *error)
+// fn makearr(src: []ItemType): [...]ItemType
+static FORCE_INLINE void doBuiltinMakeArr(Fiber *fiber, HeapPages *pages, Error *error)
 {
     void *dest = (fiber->top++)->ptrVal;
     const DynArray *src = (fiber->top++)->ptrVal;
@@ -2068,15 +2302,15 @@ static FORCE_INLINE void doBuiltinMaketoarr(Fiber *fiber, HeapPages *pages, Erro
         memcpy(dest, src->data, getDims(src)->len * src->itemSize);
 
         // Increase result items' ref counts, as if they have been assigned one by one
-        doChangeRefCntImpl(fiber, pages, dest, destType, TOK_PLUSPLUS);
+        doRefCntImpl(pages, dest, destType, TOK_PLUSPLUS);
     }
 
     (--fiber->top)->ptrVal = dest;
 }
 
 
-// fn maketostr(src: char | []char | []uint8): str
-static FORCE_INLINE void doBuiltinMaketostr(Fiber *fiber, HeapPages *pages, Error *error)
+// fn makestr(src: char | []char | []uint8): str
+static FORCE_INLINE void doBuiltinMakeStr(Fiber *fiber, HeapPages *pages, Error *error)
 {
     char *dest = doGetEmptyStr();
 
@@ -2116,6 +2350,23 @@ static FORCE_INLINE void doBuiltinMaketostr(Fiber *fiber, HeapPages *pages, Erro
 }
 
 
+// fn copy(s: str): str
+static FORCE_INLINE void doBuiltinCopyStr(Fiber *fiber, HeapPages *pages, Error *error)
+{
+    const char *str = (fiber->top++)->ptrVal;
+    char *result = NULL;
+
+    if (str)
+    {
+        doCheckStr(str, error);
+        result = doAllocStr(pages, getStrDims(str)->len, error);
+        strcpy(result, str);
+    }
+
+    (--fiber->top)->ptrVal = result;
+}
+
+
 // fn copy(array: [] type): [] type
 static FORCE_INLINE void doBuiltinCopyDynArray(Fiber *fiber, HeapPages *pages, Error *error)
 {
@@ -2134,7 +2385,7 @@ static FORCE_INLINE void doBuiltinCopyDynArray(Fiber *fiber, HeapPages *pages, E
 
         // Increase result items' ref counts, as if they have been assigned one by one
         const Type staticArrayType = typeMakeDetachedArray(result->type->base, getDims(result)->len);
-        doChangeRefCntImpl(fiber, pages, result->data, &staticArrayType, TOK_PLUSPLUS);
+        doRefCntImpl(pages, result->data, &staticArrayType, TOK_PLUSPLUS);
     }
 
     (--fiber->top)->ptrVal = result;
@@ -2164,8 +2415,11 @@ static FORCE_INLINE void doBuiltinCopyMap(Fiber *fiber, HeapPages *pages, Error 
 
 static FORCE_INLINE void doBuiltinCopy(Fiber *fiber, HeapPages *pages, Error *error)
 {
-    const Type *type  = fiber->code[fiber->ip].type;
-    if (type->kind == TYPE_DYNARRAY)
+    const Type *type = fiber->code[fiber->ip].type;
+    
+    if (type->kind == TYPE_STR)
+        doBuiltinCopyStr(fiber, pages, error);
+    else if (type->kind == TYPE_DYNARRAY)
         doBuiltinCopyDynArray(fiber, pages, error);
     else
         doBuiltinCopyMap(fiber, pages, error);
@@ -2209,14 +2463,14 @@ static FORCE_INLINE void doBuiltinAppend(Fiber *fiber, HeapPages *pages, Error *
 
     if (newLen <= getDims(array)->capacity)
     {
-        doChangeRefCntImpl(fiber, pages, array, array->type, TOK_PLUSPLUS);
+        doRefCntImpl(pages, array, array->type, TOK_PLUSPLUS);
         *result = *array;
 
         memmove((char *)result->data + getDims(array)->len * array->itemSize, (char *)rhs, rhsLen * array->itemSize);
 
         // Increase result items' ref counts, as if they have been assigned one by one
         const Type staticArrayType = typeMakeDetachedArray(result->type->base, rhsLen);
-        doChangeRefCntImpl(fiber, pages, (char *)result->data + getDims(array)->len * array->itemSize, &staticArrayType, TOK_PLUSPLUS);
+        doRefCntImpl(pages, (char *)result->data + getDims(array)->len * array->itemSize, &staticArrayType, TOK_PLUSPLUS);
 
         getDims(result)->len = newLen;
     }
@@ -2229,7 +2483,7 @@ static FORCE_INLINE void doBuiltinAppend(Fiber *fiber, HeapPages *pages, Error *
 
         // Increase result items' ref counts, as if they have been assigned one by one
         const Type staticArrayType = typeMakeDetachedArray(result->type->base, newLen);
-        doChangeRefCntImpl(fiber, pages, result->data, &staticArrayType, TOK_PLUSPLUS);
+        doRefCntImpl(pages, result->data, &staticArrayType, TOK_PLUSPLUS);
     }
 
     (--fiber->top)->ptrVal = result;
@@ -2257,7 +2511,7 @@ static FORCE_INLINE void doBuiltinInsert(Fiber *fiber, HeapPages *pages, Error *
 
     if (getDims(array)->len + 1 <= getDims(array)->capacity)
     {
-        doChangeRefCntImpl(fiber, pages, array, array->type, TOK_PLUSPLUS);
+        doRefCntImpl(pages, array, array->type, TOK_PLUSPLUS);
         *result = *array;
 
         memmove((char *)result->data + (index + 1) * result->itemSize, (char *)result->data + index * result->itemSize, (getDims(array)->len - index) * result->itemSize);
@@ -2265,7 +2519,7 @@ static FORCE_INLINE void doBuiltinInsert(Fiber *fiber, HeapPages *pages, Error *
 
         // Increase result items' ref counts, as if they have been assigned one by one
         const Type staticArrayType = typeMakeDetachedArray(result->type->base, 1);
-        doChangeRefCntImpl(fiber, pages, (char *)result->data + index * result->itemSize, &staticArrayType, TOK_PLUSPLUS);
+        doRefCntImpl(pages, (char *)result->data + index * result->itemSize, &staticArrayType, TOK_PLUSPLUS);
 
         getDims(result)->len++;
     }
@@ -2279,7 +2533,7 @@ static FORCE_INLINE void doBuiltinInsert(Fiber *fiber, HeapPages *pages, Error *
 
         // Increase result items' ref counts, as if they have been assigned one by one
         const Type staticArrayType = typeMakeDetachedArray(result->type->base, getDims(result)->len);
-        doChangeRefCntImpl(fiber, pages, result->data, &staticArrayType, TOK_PLUSPLUS);
+        doRefCntImpl(pages, result->data, &staticArrayType, TOK_PLUSPLUS);
     }
 
     (--fiber->top)->ptrVal = result;
@@ -2299,12 +2553,12 @@ static FORCE_INLINE void doBuiltinDeleteDynArray(Fiber *fiber, HeapPages *pages,
     if (UNLIKELY(index < 0 || index > getDims(array)->len - 1))
         error->runtimeHandler(error->context, ERR_RUNTIME, "Index %lld is out of range 0...%lld", index, getDims(array)->len - 1);
 
-    doChangeRefCntImpl(fiber, pages, array, array->type, TOK_PLUSPLUS);
+    doRefCntImpl(pages, array, array->type, TOK_PLUSPLUS);
     *result = *array;
 
     // Decrease result item's ref count
     const Type staticArrayType = typeMakeDetachedArray(result->type->base, 1);
-    doChangeRefCntImpl(fiber, pages, (char *)result->data + index * result->itemSize, &staticArrayType, TOK_MINUSMINUS);
+    doRefCntImpl(pages, (char *)result->data + index * result->itemSize, &staticArrayType, TOK_MINUSMINUS);
 
     memmove((char *)result->data + index * result->itemSize, (char *)result->data + (index + 1) * result->itemSize, (getDims(array)->len - index - 1) * result->itemSize);
 
@@ -2353,13 +2607,13 @@ static FORCE_INLINE void doBuiltinDeleteMap(Fiber *fiber, HeapPages *pages, Erro
         node->left = NULL;
         node->right = NULL;
 
-        doChangeRefCntImpl(fiber, pages, node, typeMapNodePtr(map->type), TOK_MINUSMINUS);
+        doRefCntImpl(pages, node, typeMapNodePtr(map->type), TOK_MINUSMINUS);
 
         if (UNLIKELY(--map->root->len < 0))
             error->runtimeHandler(error->context, ERR_RUNTIME, "Map length is negative");
     }
 
-    doChangeRefCntImpl(fiber, pages, map->root, typeMapNodePtr(map->type), TOK_PLUSPLUS);
+    doRefCntImpl(pages, map->root, typeMapNodePtr(map->type), TOK_PLUSPLUS);
     result->type = map->type;
     result->root = map->root;
 
@@ -2437,7 +2691,7 @@ static FORCE_INLINE void doBuiltinSlice(Fiber *fiber, HeapPages *pages, Error *e
 
         // Increase result items' ref counts, as if they have been assigned one by one
         const Type staticArrayType = typeMakeDetachedArray(result->type->base, getDims(result)->len);
-        doChangeRefCntImpl(fiber, pages, result->data, &staticArrayType, TOK_PLUSPLUS);
+        doRefCntImpl(pages, result->data, &staticArrayType, TOK_PLUSPLUS);
 
         (--fiber->top)->ptrVal = result;
     }
@@ -2468,19 +2722,19 @@ static int qsortCompare(const void *a, const void *b, void *context)
     const Closure *compare  = ((CompareContext *)context)->compare;
     const Type *compareType = ((CompareContext *)context)->compareType;
 
-    const Signature *compareSig = &compareType->field[0]->type->sig;
+    const Signature *compareSig = compareType->field[0]->type->sig;
 
     // Push upvalues
     fiber->top -= sizeof(Interface) / sizeof(Slot);
     *(Interface *)fiber->top = compare->upvalue;
-    doChangeRefCntImpl(fiber, &fiber->vm->pages, fiber->top, compareSig->param[0]->type, TOK_PLUSPLUS);
+    doRefCntImpl(&fiber->vm->pages, fiber->top, compareSig->param[0]->type, TOK_PLUSPLUS);
 
     // Push pointers to values to be compared
     (--fiber->top)->ptrVal = (void *)a;
-    doChangeRefCntImpl(fiber, &fiber->vm->pages, fiber->top->ptrVal, compareSig->param[1]->type, TOK_PLUSPLUS);
+    doRefCntImpl(&fiber->vm->pages, fiber->top->ptrVal, compareSig->param[1]->type, TOK_PLUSPLUS);
 
     (--fiber->top)->ptrVal = (void *)b;
-    doChangeRefCntImpl(fiber, &fiber->vm->pages, fiber->top->ptrVal, compareSig->param[2]->type, TOK_PLUSPLUS);
+    doRefCntImpl(&fiber->vm->pages, fiber->top->ptrVal, compareSig->param[2]->type, TOK_PLUSPLUS);
 
     // Push 'return from VM' signal as return address
     (--fiber->top)->intVal = RETURN_FROM_VM;
@@ -2550,7 +2804,7 @@ static int qsortFastCompare(const void *a, const void *b, void *context)
 }
 
 
-static FORCE_INLINE void doBuiltinSortfast(Fiber *fiber, Error *error)
+static FORCE_INLINE void doBuiltinSortFast(Fiber *fiber, Error *error)
 {
     const int64_t offset = (fiber->top++)->intVal;
     const bool ascending = (bool)(fiber->top++)->intVal;
@@ -2612,15 +2866,31 @@ static FORCE_INLINE void doBuiltinLen(Fiber *fiber, Error *error)
 
 static FORCE_INLINE void doBuiltinCap(Fiber *fiber, Error *error)
 {
-    const DynArray *array = fiber->top->ptrVal;
-    if (UNLIKELY(!array))
-        error->runtimeHandler(error->context, ERR_RUNTIME, "Dynamic array is null");
+    switch (fiber->code[fiber->ip].typeKind)
+    {
+        case TYPE_DYNARRAY:
+        {
+            const DynArray *array = fiber->top->ptrVal;
+            if (UNLIKELY(!array))
+                error->runtimeHandler(error->context, ERR_RUNTIME, "Dynamic array is null");
 
-    fiber->top->intVal = array->data ? getDims(array)->capacity : 0;
+            fiber->top->intVal = array->data ? getDims(array)->capacity : 0; 
+            break;           
+        }
+        case TYPE_STR:
+        {
+            const char *str = fiber->top->ptrVal;
+            doCheckStr(str, error);
+            fiber->top->intVal = str ? getStrDims(str)->capacity : 0;
+            break;
+        }
+        default:
+            error->runtimeHandler(error->context, ERR_RUNTIME, "Illegal type"); return;        
+    }
 }
 
 
-static FORCE_INLINE void doBuiltinSizeofself(Fiber *fiber, Error *error)
+static FORCE_INLINE void doBuiltinSizeOfSelf(Fiber *fiber, Error *error)
 {
     const Interface *interface = fiber->top->ptrVal;
     if (UNLIKELY(!interface))
@@ -2634,7 +2904,7 @@ static FORCE_INLINE void doBuiltinSizeofself(Fiber *fiber, Error *error)
 }
 
 
-static FORCE_INLINE void doBuiltinSelfptr(Fiber *fiber, Error *error)
+static FORCE_INLINE void doBuiltinSelfPtr(Fiber *fiber, Error *error)
 {
     Interface *interface = fiber->top->ptrVal;
     if (UNLIKELY(!interface))
@@ -2644,7 +2914,7 @@ static FORCE_INLINE void doBuiltinSelfptr(Fiber *fiber, Error *error)
 }
 
 
-static FORCE_INLINE void doBuiltinSelfhasptr(Fiber *fiber, Error *error)
+static FORCE_INLINE void doBuiltinSelfHasPtr(Fiber *fiber, Error *error)
 {
     const Interface *interface = fiber->top->ptrVal;
     if (UNLIKELY(!interface))
@@ -2658,7 +2928,7 @@ static FORCE_INLINE void doBuiltinSelfhasptr(Fiber *fiber, Error *error)
 }
 
 
-static FORCE_INLINE void doBuiltinSelftypeeq(Fiber *fiber, Error *error)
+static FORCE_INLINE void doBuiltinSelfTypeEq(Fiber *fiber, Error *error)
 {
     const Interface *right = (fiber->top++)->ptrVal;
     const Interface *left  = (fiber->top++)->ptrVal;
@@ -2725,7 +2995,7 @@ static FORCE_INLINE void doBuiltinValid(Fiber *fiber, Error *error)
 
 
 // fn validkey(m: map [keyType] type, key: keyType): bool
-static FORCE_INLINE void doBuiltinValidkey(Fiber *fiber, HeapPages *pages, Error *error)
+static FORCE_INLINE void doBuiltinValidKey(Fiber *fiber, HeapPages *pages, Error *error)
 {
     Slot key  = *fiber->top++;
     Map *map  = (fiber->top++)->ptrVal;
@@ -2764,7 +3034,7 @@ static FORCE_INLINE void doBuiltinKeys(Fiber *fiber, HeapPages *pages, Error *er
 
         // Increase result items' ref counts, as if they have been assigned one by one
         const Type staticArrayType = typeMakeDetachedArray(result->type->base, getDims(result)->len);
-        doChangeRefCntImpl(fiber, pages, result->data, &staticArrayType, TOK_PLUSPLUS);
+        doRefCntImpl(pages, result->data, &staticArrayType, TOK_PLUSPLUS);
     }
 
     (--fiber->top)->ptrVal = result;
@@ -2785,9 +3055,16 @@ static FORCE_INLINE void doBuiltinResume(Fiber *fiber, Fiber **newFiber, Error *
 
 
 // fn memusage(): int
-static FORCE_INLINE void doBuiltinMemusage(Fiber *fiber, HeapPages *pages, Error *error)
+static FORCE_INLINE void doBuiltinMemUsage(Fiber *fiber, HeapPages *pages, Error *error)
 {
     (--fiber->top)->intVal = pages->totalSize;
+}
+
+
+// fn leaksan(level: int)
+static FORCE_INLINE void doBuiltinLeakSan(Fiber *fiber, HeapPages *pages, Error *error)
+{
+    pages->leakSanLevel = (fiber->top++)->intVal;
 }
 
 
@@ -2804,10 +3081,14 @@ static FORCE_INLINE void doBuiltinExit(Fiber *fiber, Error *error)
 static FORCE_INLINE void doPush(Fiber *fiber, Error *error)
 {
     (--fiber->top)->intVal = fiber->code[fiber->ip].operand.intVal;
+    fiber->ip++;
+}
 
-    if (fiber->code[fiber->ip].inlineOpcode == OP_DEREF)
-        doDerefImpl(fiber->top, fiber->code[fiber->ip].typeKind, error);
 
+static FORCE_INLINE void doPushGlobal(Fiber *fiber, Error *error)
+{
+    (--fiber->top)->ptrVal = fiber->code[fiber->ip].operand.ptrVal;
+    doDerefImpl(fiber->top, fiber->code[fiber->ip].typeKind, error);
     fiber->ip++;
 }
 
@@ -2913,13 +3194,21 @@ static FORCE_INLINE void doDeref(Fiber *fiber, Error *error)
 }
 
 
-static FORCE_INLINE void doAssign(Fiber *fiber, Error *error)
+static FORCE_INLINE void doAssign(Fiber *fiber, bool swap, Error *error)
 {
-    if (fiber->code[fiber->ip].inlineOpcode == OP_SWAP)
-        doSwapImpl(fiber->top);
-
-    const Slot rhs = *fiber->top++;
-    void *lhs = (fiber->top++)->ptrVal;
+    Slot rhs;
+    void *lhs;
+    
+    if (swap)
+    {
+        lhs = (fiber->top++)->ptrVal;
+        rhs = *fiber->top++; 
+    }
+    else
+    {
+        rhs = *fiber->top++;
+        lhs = (fiber->top++)->ptrVal;        
+    }
 
     doAssignImpl(lhs, rhs, fiber->code[fiber->ip].typeKind, fiber->code[fiber->ip].operand.intVal, error);
     fiber->ip++;
@@ -2945,19 +3234,19 @@ static FORCE_INLINE void doAssignParam(Fiber *fiber, Error *error)
 }
 
 
-static FORCE_INLINE void doChangeRefCnt(Fiber *fiber, HeapPages *pages)
+static FORCE_INLINE void doRefCnt(Fiber *fiber, HeapPages *pages)
 {
     void *ptr = fiber->top->ptrVal;
     const TokenKind tokKind = fiber->code[fiber->ip].tokKind;
     const Type *type = fiber->code[fiber->ip].type;
 
-    doChangeRefCntImpl(fiber, pages, ptr, type, tokKind);
+    doRefCntImpl(pages, ptr, type, tokKind);
 
     fiber->ip++;
 }
 
 
-static FORCE_INLINE void doChangeRefCntGlobal(Fiber *fiber, HeapPages *pages, Error *error)
+static FORCE_INLINE void doRefCntGlobal(Fiber *fiber, HeapPages *pages, Error *error)
 {
     const TokenKind tokKind = fiber->code[fiber->ip].tokKind;
     const Type *type = fiber->code[fiber->ip].type;
@@ -2966,13 +3255,13 @@ static FORCE_INLINE void doChangeRefCntGlobal(Fiber *fiber, HeapPages *pages, Er
     Slot slot = {.ptrVal = ptr};
 
     doDerefImpl(&slot, type->kind, error);
-    doChangeRefCntImpl(fiber, pages, slot.ptrVal, type, tokKind);
+    doRefCntImpl(pages, slot.ptrVal, type, tokKind);
 
     fiber->ip++;
 }
 
 
-static FORCE_INLINE void doChangeRefCntLocal(Fiber *fiber, HeapPages *pages, Error *error)
+static FORCE_INLINE void doRefCntLocal(Fiber *fiber, HeapPages *pages, Error *error)
 {
     const TokenKind tokKind = fiber->code[fiber->ip].tokKind;
     const Type *type = fiber->code[fiber->ip].type;
@@ -2981,29 +3270,38 @@ static FORCE_INLINE void doChangeRefCntLocal(Fiber *fiber, HeapPages *pages, Err
     Slot slot = {.ptrVal = (int8_t *)fiber->base + offset};
 
     doDerefImpl(&slot, type->kind, error);
-    doChangeRefCntImpl(fiber, pages, slot.ptrVal, type, tokKind);
+    doRefCntImpl(pages, slot.ptrVal, type, tokKind);
 
     fiber->ip++;
 }
 
 
-static FORCE_INLINE void doChangeRefCntAssign(Fiber *fiber, HeapPages *pages, Error *error)
+static FORCE_INLINE void doRefCntAssign(Fiber *fiber, HeapPages *pages, bool swap, Error *error)
 {
-    if (fiber->code[fiber->ip].inlineOpcode == OP_SWAP)
-        doSwapImpl(fiber->top);
+    Slot rhs;
+    void *lhs;
 
-    const Slot rhs = *fiber->top++;
-    void *lhs = (fiber->top++)->ptrVal;
+    if (swap)
+    {
+        lhs = (fiber->top++)->ptrVal;
+        rhs = *fiber->top++; 
+    }
+    else
+    {
+        rhs = *fiber->top++;
+        lhs = (fiber->top++)->ptrVal;        
+    }
+
     const Type *type = fiber->code[fiber->ip].type;
 
     // Increase right-hand side ref count
     if (fiber->code[fiber->ip].tokKind != TOK_MINUSMINUS)      // "--" means that the right-hand side ref count should not be increased
-        doChangeRefCntImpl(fiber, pages, rhs.ptrVal, type, TOK_PLUSPLUS);
+        doRefCntImpl(pages, rhs.ptrVal, type, TOK_PLUSPLUS);
 
     // Decrease left-hand side ref count
     Slot lhsDeref = {.ptrVal = lhs};
     doDerefImpl(&lhsDeref, type->kind, error);
-    doChangeRefCntImpl(fiber, pages, lhsDeref.ptrVal, type, TOK_MINUSMINUS);
+    doRefCntImpl(pages, lhsDeref.ptrVal, type, TOK_MINUSMINUS);
 
     doAssignImpl(lhs, rhs, type->kind, type->size, error);
     fiber->ip++;
@@ -3144,8 +3442,8 @@ static FORCE_INLINE void doBinary(Fiber *fiber, HeapPages *pages, Error *error)
                 if (inPlace)
                 {
                     buf = lhsStr;
-                    Type strType = {.kind = TYPE_STR};
-                    doChangeRefCntImpl(fiber, pages, buf, &strType, TOK_PLUSPLUS);
+                    const Type strType = {.kind = TYPE_STR};
+                    doRefCntImpl(pages, buf, &strType, TOK_PLUSPLUS);
                 }
                 else
                 {
@@ -3301,7 +3599,7 @@ static FORCE_INLINE void doBinary(Fiber *fiber, HeapPages *pages, Error *error)
 }
 
 
-static FORCE_INLINE void doGetArrayPtr(Fiber *fiber, Error *error)
+static FORCE_INLINE void doGetArrayPtr(Fiber *fiber, bool dereference, Error *error)
 {
     const int64_t itemSize = fiber->code[fiber->ip].operand.int32Val[0];
     int64_t len = fiber->code[fiber->ip].operand.int32Val[1];
@@ -3327,14 +3625,14 @@ static FORCE_INLINE void doGetArrayPtr(Fiber *fiber, Error *error)
 
     fiber->top->ptrVal = data + itemSize * index;
 
-    if (fiber->code[fiber->ip].inlineOpcode == OP_DEREF)
+    if (dereference)
         doDerefImpl(fiber->top, fiber->code[fiber->ip].typeKind, error);
 
     fiber->ip++;
 }
 
 
-static FORCE_INLINE void doGetDynArrayPtr(Fiber *fiber, Error *error)
+static FORCE_INLINE void doGetDynArrayPtr(Fiber *fiber, bool dereference, Error *error)
 {
     const int64_t index = (fiber->top++)->intVal;
     const DynArray *array = (fiber->top++)->ptrVal;
@@ -3350,14 +3648,14 @@ static FORCE_INLINE void doGetDynArrayPtr(Fiber *fiber, Error *error)
 
     (--fiber->top)->ptrVal = (char *)array->data + itemSize * index;
 
-    if (fiber->code[fiber->ip].inlineOpcode == OP_DEREF)
+    if (dereference)
         doDerefImpl(fiber->top, fiber->code[fiber->ip].typeKind, error);
 
     fiber->ip++;
 }
 
 
-static FORCE_INLINE void doGetMapPtr(Fiber *fiber, HeapPages *pages, Error *error)
+static FORCE_INLINE void doGetMapPtr(Fiber *fiber, HeapPages *pages, bool dereference, Error *error)
 {
     const Slot key = *fiber->top++;
     Map *map = (fiber->top++)->ptrVal;
@@ -3382,19 +3680,23 @@ static FORCE_INLINE void doGetMapPtr(Fiber *fiber, HeapPages *pages, Error *erro
         node->data = chunkAlloc(pages, itemType->size, itemType->kind == TYPE_DYNARRAY ? NULL : itemType, NULL, false, error);
 
         // Increase key ref count
-        if (typeGarbageCollected(keyType))
-            doChangeRefCntImpl(fiber, pages, key.ptrVal, keyType, TOK_PLUSPLUS);
+        if (keyType->isGarbageCollected)
+            doRefCntImpl(pages, key.ptrVal, keyType, TOK_PLUSPLUS);
 
         doAssignImpl(node->key, key, keyType->kind, keyType->size, error);
         map->root->len++;
     }
 
-    (--fiber->top)->ptrVal = node->data;
+    (--fiber->top)->ptrVal = node->data;    
+
+    if (dereference)
+        doDerefImpl(fiber->top, fiber->code[fiber->ip].typeKind, error);    
+
     fiber->ip++;
 }
 
 
-static FORCE_INLINE void doGetFieldPtr(Fiber *fiber, Error *error)
+static FORCE_INLINE void doGetFieldPtr(Fiber *fiber, bool dereference, Error *error)
 {
     const int64_t fieldOffset = fiber->code[fiber->ip].operand.intVal;
 
@@ -3403,7 +3705,7 @@ static FORCE_INLINE void doGetFieldPtr(Fiber *fiber, Error *error)
 
     fiber->top->ptrVal = (char *)fiber->top->ptrVal + fieldOffset;
 
-    if (fiber->code[fiber->ip].inlineOpcode == OP_DEREF)
+    if (dereference)
         doDerefImpl(fiber->top, fiber->code[fiber->ip].typeKind, error);
 
     fiber->ip++;
@@ -3552,7 +3854,7 @@ static FORCE_INLINE void doCallExtern(Fiber *fiber, Error *error)
     fiber->reg[REG_RESULT].ptrVal = error->context;    // Upon entry, the result slot stores the Umka instance
 
     const int ip = fiber->ip;
-    fn(&fiber->base[2].apiSlot, &fiber->reg[REG_RESULT].apiSlot);      // + 2 from base pointer for old base pointer and return address
+    fn(&stackGetFrameParams(fiber->base)->apiSlot, &fiber->reg[REG_RESULT].apiSlot);
     fiber->ip = ip;
 
     fiber->ip++;
@@ -3578,10 +3880,10 @@ static FORCE_INLINE void doCallBuiltin(Fiber *fiber, Fiber **newFiber, HeapPages
         case BUILTIN_SSCANF:        doBuiltinScanf (fiber, pages, false, true,  error); break;
 
         // Math
-        case BUILTIN_REAL:
-        case BUILTIN_REAL_LHS:
+        case BUILTIN_MAKEREAL:
+        case BUILTIN_MAKEREALLEFT:
         {
-            const int depth = (builtin == BUILTIN_REAL_LHS) ? 1 : 0;
+            const int depth = (builtin == BUILTIN_MAKEREALLEFT) ? 1 : 0;
             if (typeKind == TYPE_UINT)
                 (fiber->top + depth)->realVal = (fiber->top + depth)->uintVal;
             else
@@ -3631,36 +3933,37 @@ static FORCE_INLINE void doCallBuiltin(Fiber *fiber, Fiber **newFiber, HeapPages
         // Memory
         case BUILTIN_NEW:           doBuiltinNew(fiber, pages, error); break;
         case BUILTIN_MAKE:          doBuiltinMake(fiber, pages, error); break;
-        case BUILTIN_MAKEFROMARR:   doBuiltinMakefromarr(fiber, pages, error); break;
-        case BUILTIN_MAKEFROMSTR:   doBuiltinMakefromstr(fiber, pages, error); break;
-        case BUILTIN_MAKETOARR:     doBuiltinMaketoarr(fiber, pages, error); break;
-        case BUILTIN_MAKETOSTR:     doBuiltinMaketostr(fiber, pages, error); break;
+        case BUILTIN_MAKEFROMARR:   doBuiltinMakeFromArr(fiber, pages, error); break;
+        case BUILTIN_MAKEFROMSTR:   doBuiltinMakeFromStr(fiber, pages, error); break;
+        case BUILTIN_MAKEARR:       doBuiltinMakeArr(fiber, pages, error); break;
+        case BUILTIN_MAKESTR:       doBuiltinMakeStr(fiber, pages, error); break;
         case BUILTIN_COPY:          doBuiltinCopy(fiber, pages, error); break;
         case BUILTIN_APPEND:        doBuiltinAppend(fiber, pages, error); break;
         case BUILTIN_INSERT:        doBuiltinInsert(fiber, pages, error); break;
         case BUILTIN_DELETE:        doBuiltinDelete(fiber, pages, error); break;
         case BUILTIN_SLICE:         doBuiltinSlice(fiber, pages, error); break;
         case BUILTIN_SORT:          doBuiltinSort(fiber, error); break;
-        case BUILTIN_SORTFAST:      doBuiltinSortfast(fiber, error); break;
+        case BUILTIN_SORTFAST:      doBuiltinSortFast(fiber, error); break;
         case BUILTIN_LEN:           doBuiltinLen(fiber, error); break;
         case BUILTIN_CAP:           doBuiltinCap(fiber, error); break;
         case BUILTIN_SIZEOF:        error->runtimeHandler(error->context, ERR_RUNTIME, "Illegal instruction"); return;       // Done at compile time
-        case BUILTIN_SIZEOFSELF:    doBuiltinSizeofself(fiber, error); break;
-        case BUILTIN_SELFPTR:       doBuiltinSelfptr(fiber, error); break;
-        case BUILTIN_SELFHASPTR:    doBuiltinSelfhasptr(fiber, error); break;
-        case BUILTIN_SELFTYPEEQ:    doBuiltinSelftypeeq(fiber, error); break;
+        case BUILTIN_SIZEOFSELF:    doBuiltinSizeOfSelf(fiber, error); break;
+        case BUILTIN_SELFPTR:       doBuiltinSelfPtr(fiber, error); break;
+        case BUILTIN_SELFHASPTR:    doBuiltinSelfHasPtr(fiber, error); break;
+        case BUILTIN_SELFTYPEEQ:    doBuiltinSelfTypeEq(fiber, error); break;
         case BUILTIN_TYPEPTR:       error->runtimeHandler(error->context, ERR_RUNTIME, "Illegal instruction"); return;       // Done at compile time
         case BUILTIN_VALID:         doBuiltinValid(fiber, error); break;
 
         // Maps
-        case BUILTIN_VALIDKEY:      doBuiltinValidkey(fiber, pages, error); break;
+        case BUILTIN_VALIDKEY:      doBuiltinValidKey(fiber, pages, error); break;
         case BUILTIN_KEYS:          doBuiltinKeys(fiber, pages, error); break;
 
         // Fibers
         case BUILTIN_RESUME:        doBuiltinResume(fiber, newFiber, error); break;
 
         // Misc
-        case BUILTIN_MEMUSAGE:      doBuiltinMemusage(fiber, pages, error); break;
+        case BUILTIN_MEMUSAGE:      doBuiltinMemUsage(fiber, pages, error); break;
+        case BUILTIN_LEAKSAN:       doBuiltinLeakSan(fiber, pages, error); break;
         case BUILTIN_EXIT:          doBuiltinExit(fiber, error); return;
     }
 
@@ -3691,10 +3994,11 @@ static FORCE_INLINE void doReturn(Fiber *fiber, Fiber **newFiber)
 
 static FORCE_INLINE void doEnterFrame(Fiber *fiber, const UmkaHookFunc *hooks, Error *error)
 {
-    const ParamAndLocalVarLayout *layout = fiber->code[fiber->ip].operand.ptrVal;
+    const StackFrameLayout *layout = fiber->code[fiber->ip].operand.ptrVal;
+    const int64_t localVarSlots = getLocalVarLayout(layout)->localVarSlots;
 
     // Allocate stack frame
-    if (UNLIKELY(fiber->top - layout->localVarSlots - fiber->stack < MEM_MIN_FREE_STACK))
+    if (UNLIKELY(fiber->top - localVarSlots - fiber->stack < MEM_MIN_FREE_STACK))
         error->runtimeHandler(error->context, ERR_RUNTIME, "Stack overflow");
 
     // Push old stack frame base pointer, set new one
@@ -3704,14 +4008,14 @@ static FORCE_INLINE void doEnterFrame(Fiber *fiber, const UmkaHookFunc *hooks, E
     // Push stack frame ref count
     (--fiber->top)->intVal = 0;
 
-    // Push parameter layout table pointer
-    (--fiber->top)->ptrVal = (ParamLayout *)layout->paramLayout;
+    // Push stack frame layout table pointer
+    (--fiber->top)->ptrVal = (StackFrameLayout *)layout;
 
     // Move stack top
-    fiber->top -= layout->localVarSlots;
+    fiber->top -= localVarSlots;
 
     // Zero the whole stack frame
-    memset(fiber->top, 0, layout->localVarSlots * sizeof(Slot));
+    memset(fiber->top, 0, localVarSlots * sizeof(Slot));
 
     // Call 'call' hook, if any
     doHook(fiber, hooks, UMKA_HOOK_CALL);
@@ -3723,8 +4027,7 @@ static FORCE_INLINE void doEnterFrame(Fiber *fiber, const UmkaHookFunc *hooks, E
 static FORCE_INLINE void doLeaveFrame(Fiber *fiber, const UmkaHookFunc *hooks, Error *error)
 {
     // Check stack frame ref count
-    const int64_t stackFrameRefCnt = fiber->base[-1].intVal;
-    if (UNLIKELY(stackFrameRefCnt != 0))
+    if (UNLIKELY(*stackGetFrameRefCnt(fiber->base) != 0))
         error->runtimeHandler(error->context, ERR_RUNTIME, "Pointer to a local variable escapes from the function");
 
     // Call 'return' hook, if any
@@ -3762,6 +4065,7 @@ static void vmLoop(VM *vm)
         switch (fiber->code[fiber->ip].opcode)
         {
             case OP_PUSH:                           doPush(fiber, error);                         break;
+            case OP_PUSH_GLOBAL:                    doPushGlobal(fiber, error);                   break;
             case OP_PUSH_ZERO:                      doPushZero(fiber, error);                     break;
             case OP_PUSH_LOCAL_PTR:                 doPushLocalPtr(fiber);                        break;
             case OP_PUSH_LOCAL_PTR_ZERO:            doPushLocalPtrZero(fiber);                    break;
@@ -3774,18 +4078,24 @@ static void vmLoop(VM *vm)
             case OP_SWAP:                           doSwap(fiber);                                break;
             case OP_ZERO:                           doZero(fiber);                                break;
             case OP_DEREF:                          doDeref(fiber, error);                        break;
-            case OP_ASSIGN:                         doAssign(fiber, error);                       break;
+            case OP_ASSIGN:                         doAssign(fiber, false, error);                break;
+            case OP_SWAP_ASSIGN:                    doAssign(fiber, true, error);                 break;
             case OP_ASSIGN_PARAM:                   doAssignParam(fiber, error);                  break;
-            case OP_CHANGE_REF_CNT:                 doChangeRefCnt(fiber, pages);                 break;
-            case OP_CHANGE_REF_CNT_GLOBAL:          doChangeRefCntGlobal(fiber, pages, error);    break;
-            case OP_CHANGE_REF_CNT_LOCAL:           doChangeRefCntLocal(fiber, pages, error);     break;
-            case OP_CHANGE_REF_CNT_ASSIGN:          doChangeRefCntAssign(fiber, pages, error);    break;
+            case OP_REF_CNT:                        doRefCnt(fiber, pages);                       break;
+            case OP_REF_CNT_GLOBAL:                 doRefCntGlobal(fiber, pages, error);          break;
+            case OP_REF_CNT_LOCAL:                  doRefCntLocal(fiber, pages, error);           break;
+            case OP_REF_CNT_ASSIGN:                 doRefCntAssign(fiber, pages, false, error);   break;
+            case OP_SWAP_REF_CNT_ASSIGN:            doRefCntAssign(fiber, pages, true, error);    break;
             case OP_UNARY:                          doUnary(fiber, error);                        break;
             case OP_BINARY:                         doBinary(fiber, pages, error);                break;
-            case OP_GET_ARRAY_PTR:                  doGetArrayPtr(fiber, error);                  break;
-            case OP_GET_DYNARRAY_PTR:               doGetDynArrayPtr(fiber, error);               break;
-            case OP_GET_MAP_PTR:                    doGetMapPtr(fiber, pages, error);             break;
-            case OP_GET_FIELD_PTR:                  doGetFieldPtr(fiber, error);                  break;
+            case OP_GET_ARRAY_PTR:                  doGetArrayPtr(fiber, false, error);           break;
+            case OP_GET_ARRAY:                      doGetArrayPtr(fiber, true, error);            break;
+            case OP_GET_DYNARRAY_PTR:               doGetDynArrayPtr(fiber, false, error);        break;
+            case OP_GET_DYNARRAY:                   doGetDynArrayPtr(fiber, true, error);         break;
+            case OP_GET_MAP_PTR:                    doGetMapPtr(fiber, pages, false, error);      break;
+            case OP_GET_MAP:                        doGetMapPtr(fiber, pages, true, error);       break;
+            case OP_GET_FIELD_PTR:                  doGetFieldPtr(fiber, false, error);           break;
+            case OP_GET_FIELD:                      doGetFieldPtr(fiber, true, error);            break;
             case OP_ASSERT_TYPE:                    doAssertType(fiber);                          break;
             case OP_ASSERT_RANGE:                   doAssertRange(fiber, error);                  break;
             case OP_WEAKEN_PTR:                     doWeakenPtr(fiber, pages);                    break;
@@ -3844,7 +4154,7 @@ void vmCall(VM *vm, UmkaFuncContext *fn)
     int numParamSlots = 0;
     if (fn->params)
     {
-        const ParamLayout *paramLayout = *vmGetParamLayout(fn->params);
+        const ParamLayout *paramLayout = getParamLayout(*vmGetStackFrameLayout(fn->params));
         numParamSlots = paramLayout->numParamSlots;
 
         if (paramLayout->numResultParams > 0)
@@ -3880,7 +4190,23 @@ void vmCall(VM *vm, UmkaFuncContext *fn)
 
 void vmCleanup(VM *vm)
 {
+    // Push 'return from VM' signal as return address
+    (--vm->fiber->top)->intVal = RETURN_FROM_VM;
+
+    // Go to the entry point
     vm->fiber->ip = JUMP_TO_CLEANUP;
+
+    // Push old stack frame base pointer, set new one
+    (--vm->fiber->top)->ptrVal = vm->fiber->base;
+    vm->fiber->base = vm->fiber->top;
+
+    // Push fake stack frame ref count
+    (--vm->fiber->top)->intVal = 0;
+
+    // Push fake stack frame layout table pointer
+    (--vm->fiber->top)->ptrVal = NULL;
+
+    // Main loop
     vmLoop(vm);
 }
 
@@ -3897,79 +4223,106 @@ void vmKill(VM *vm)
 }
 
 
-int vmAsm(int ip, const Instruction *code, const DebugInfo *debugPerInstr, char *buf, int size)
+int vmAsm(int ip, const Instruction *code, const DebugInfo *debugPerInstr, const Idents *idents, char *buf, int size)
 {
     const Instruction *instr = &code[ip];
     const DebugInfo *debug = &debugPerInstr[ip];
 
     char opcodeBuf[DEFAULT_STR_LEN + 1];
-    snprintf(opcodeBuf, DEFAULT_STR_LEN + 1, "%s%s", instr->inlineOpcode == OP_SWAP ? "SWAP; " : "", opcodeSpelling[instr->opcode]);
+    snprintf(opcodeBuf, DEFAULT_STR_LEN + 1, "%s", opcodeSpelling[instr->opcode]);
     int chars = snprintf(buf, size, "%09d %6d %28s", ip, debug->line, opcodeBuf);
 
     if (instr->tokKind != TOK_NONE)
-        chars += snprintf(buf + chars, nonneg(size - chars), " %s", lexSpelling(instr->tokKind));
+        chars += snprintf(nonnull(buf, chars), nonneg(size - chars), " %s", lexSpelling(instr->tokKind));
 
     if (instr->type)
     {
         char typeBuf[DEFAULT_STR_LEN + 1];
-        chars += snprintf(buf + chars, nonneg(size - chars), " %s", typeSpelling(instr->type, typeBuf));
+        chars += snprintf(nonnull(buf, chars), nonneg(size - chars), " %s", typeSpelling(instr->type, typeBuf));
     }
 
-    if (instr->typeKind != TYPE_NONE && (!instr->type || instr->opcode == OP_ASSERT_RANGE))
-        chars += snprintf(buf + chars, nonneg(size - chars), " %s", typeKindSpelling(instr->typeKind));
+    if (instr->typeKind != TYPE_NONE && (!instr->type || instr->opcode == OP_ASSERT_RANGE || instr->opcode == OP_GET_MAP))
+        chars += snprintf(nonnull(buf, chars), nonneg(size - chars), " %s", typeKindSpelling(instr->typeKind));
 
+    char varBuf[DEFAULT_STR_LEN + 1];
+    
     switch (instr->opcode)
     {
         case OP_PUSH:
         {
-            if (instr->typeKind == TYPE_PTR || instr->inlineOpcode == OP_DEREF)
-                chars += snprintf(buf + chars, nonneg(size - chars), " %p", instr->operand.ptrVal);
+            if (instr->typeKind == TYPE_PTR)
+                chars += snprintf(nonnull(buf, chars), nonneg(size - chars), " %s", identSpellingByPtr(idents, instr->operand.ptrVal, varBuf));
             else if (instr->typeKind == TYPE_REAL)
-                chars += snprintf(buf + chars, nonneg(size - chars), " %lg", instr->operand.realVal);
+                chars += snprintf(nonnull(buf, chars), nonneg(size - chars), " %lg", instr->operand.realVal);
             else
-                chars += snprintf(buf + chars, nonneg(size - chars), " %lld", (long long int)instr->operand.intVal);
+                chars += snprintf(nonnull(buf, chars), nonneg(size - chars), " %lld", (long long int)instr->operand.intVal);
             break;
         }
         case OP_PUSH_REG:
-        case OP_POP_REG:                chars += snprintf(buf + chars, nonneg(size - chars), " %s",  regSpelling[instr->operand.intVal]); break;
+        case OP_POP_REG:
+        {
+            chars += snprintf(nonnull(buf, chars), nonneg(size - chars), " %s", regSpelling[instr->operand.intVal]); 
+            break;
+        }
         case OP_PUSH_ZERO:
         case OP_PUSH_LOCAL_PTR:
         case OP_PUSH_LOCAL:
         case OP_POP:
         case OP_ZERO:
         case OP_ASSIGN:
+        case OP_SWAP_ASSIGN:
         case OP_ASSIGN_PARAM:
-        case OP_CHANGE_REF_CNT_LOCAL:
+        case OP_REF_CNT_LOCAL:
         case OP_GET_FIELD_PTR:
+        case OP_GET_FIELD:
         case OP_GOTO:
         case OP_GOTO_IF:
         case OP_GOTO_IF_NOT:
         case OP_CALL_INDIRECT:
-        case OP_RETURN:                 chars += snprintf(buf + chars, nonneg(size - chars), " %lld",  (long long int)instr->operand.intVal); break;
+        case OP_RETURN:                 
+        {
+            chars += snprintf(nonnull(buf, chars), nonneg(size - chars), " %lld", (long long int)instr->operand.intVal); 
+            break;
+        }
         case OP_CALL:
         {
             const char *fnName = debugPerInstr[instr->operand.intVal].fnName;
-            chars += snprintf(buf + chars, nonneg(size - chars), " %s (%lld)", fnName, (long long int)instr->operand.intVal);
+            chars += snprintf(nonnull(buf, chars), nonneg(size - chars), " %s (%lld)", fnName, (long long int)instr->operand.intVal);
             break;
         }
         case OP_PUSH_LOCAL_PTR_ZERO:
-        case OP_GET_ARRAY_PTR:          chars += snprintf(buf + chars, nonneg(size - chars), " %d %d", (int)instr->operand.int32Val[0], (int)instr->operand.int32Val[1]); break;
-        case OP_CHANGE_REF_CNT_GLOBAL:
+        case OP_GET_ARRAY_PTR:
+        case OP_GET_ARRAY:              
+        {
+            chars += snprintf(nonnull(buf, chars), nonneg(size - chars), " %d %d", (int)instr->operand.int32Val[0], (int)instr->operand.int32Val[1]); 
+            break;
+        }
+        case OP_PUSH_GLOBAL:       
+        case OP_REF_CNT_GLOBAL:
+        {
+            chars += snprintf(nonnull(buf, chars), nonneg(size - chars), " %s", identSpellingByPtr(idents, instr->operand.ptrVal, varBuf)); 
+            break;
+        }
         case OP_ENTER_FRAME:
-        case OP_CALL_EXTERN:            chars += snprintf(buf + chars, nonneg(size - chars), " %p",    instr->operand.ptrVal); break;
-        case OP_CALL_BUILTIN:           chars += snprintf(buf + chars, nonneg(size - chars), " %s",    builtinSpelling[instr->operand.builtinVal]); break;
-
-        default: break;
+        case OP_CALL_EXTERN:            
+        {
+            chars += snprintf(nonnull(buf, chars), nonneg(size - chars), " %p",instr->operand.ptrVal); 
+            break;
+        }
+        case OP_CALL_BUILTIN:
+        {
+            chars += snprintf(nonnull(buf, chars), nonneg(size - chars), " %s", builtinSpelling[instr->operand.builtinVal]); 
+            break;
+        }
+        default: 
+            break;
     }
-
-    if (instr->inlineOpcode == OP_DEREF)
-        chars += snprintf(buf + chars, nonneg(size - chars), "; DEREF");
 
     return chars;
 }
 
 
-bool vmUnwindCallStack(VM *vm, Slot **base, int *ip)
+bool vmUnwindCallStack(VM *vm, const Slot **base, int *ip)
 {
     return stackUnwind(vm->fiber, base, ip);
 }
@@ -3989,13 +4342,13 @@ void *vmAllocData(VM *vm, int size, UmkaExternFunc onFree)
 
 void vmIncRef(VM *vm, void *ptr, const Type *type)
 {
-    doChangeRefCntImpl(vm->fiber, &vm->pages, ptr, type, TOK_PLUSPLUS);
+    doRefCntImpl(&vm->pages, ptr, type, TOK_PLUSPLUS);
 }
 
 
 void vmDecRef(VM *vm, void *ptr, const Type *type)
 {
-    doChangeRefCntImpl(vm->fiber, &vm->pages, ptr, type, TOK_MINUSMINUS);
+    doRefCntImpl(&vm->pages, ptr, type, TOK_MINUSMINUS);
 }
 
 
@@ -4025,7 +4378,7 @@ void vmMakeDynArray(VM *vm, DynArray *array, const Type *type, int len)
     if (!array)
         return;
 
-    doChangeRefCntImpl(vm->fiber, &vm->pages, array, type, TOK_MINUSMINUS);
+    doRefCntImpl(&vm->pages, array, type, TOK_MINUSMINUS);
     doAllocDynArray(&vm->pages, array, type, len, vm->error);
 }
 

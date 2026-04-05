@@ -52,8 +52,8 @@ typedef enum
     BUILTIN_SSCANF,
 
     // Math
-    BUILTIN_REAL,           // Integer to real at stack top (right operand)
-    BUILTIN_REAL_LHS,       // Integer to real at stack top + 1 (left operand) - implicit calls only
+    BUILTIN_MAKEREAL,           // Integer to real at stack top (right operand)
+    BUILTIN_MAKEREALLEFT,       // Integer to real at stack top + 1 (left operand) - implicit calls only
     BUILTIN_ROUND,
     BUILTIN_TRUNC,
     BUILTIN_CEIL,
@@ -73,8 +73,8 @@ typedef enum
     BUILTIN_MAKE,
     BUILTIN_MAKEFROMARR,    // Array to dynamic array - implicit calls only
     BUILTIN_MAKEFROMSTR,    // String to dynamic array - implicit calls only
-    BUILTIN_MAKETOARR,      // Dynamic array to array - implicit calls only
-    BUILTIN_MAKETOSTR,      // Character or dynamic array to string - implicit calls only
+    BUILTIN_MAKEARR,        // Dynamic array to array - implicit calls only
+    BUILTIN_MAKESTR,        // Character or dynamic array to string - implicit calls only
     BUILTIN_COPY,
     BUILTIN_APPEND,
     BUILTIN_INSERT,
@@ -101,6 +101,7 @@ typedef enum
 
     // Misc
     BUILTIN_MEMUSAGE,
+    BUILTIN_LEAKSAN,
     BUILTIN_EXIT
 } BuiltinFunc;
 
@@ -118,7 +119,6 @@ typedef union
 typedef struct
 {
     IdentName name;
-    unsigned int hash;
     const struct tagType *type;
     int offset;
 } Field;
@@ -127,7 +127,6 @@ typedef struct
 typedef struct
 {
     IdentName name;
-    unsigned int hash;
     Const val;
 } EnumConst;
 
@@ -135,7 +134,6 @@ typedef struct
 typedef struct
 {
     IdentName name;
-    unsigned int hash;
     const struct tagType *type;
     Const defaultVal;
 } Param;
@@ -145,7 +143,7 @@ typedef struct
 {
     int numParams, numDefaultParams;
     bool isMethod;
-    int offsetFromSelf;                     // For interface methods
+    bool isInterfaceMethod;
     const Param *param[MAX_PARAMS];
     const struct tagType *resultType;
 } Signature;
@@ -155,18 +153,20 @@ typedef struct tagType
 {
     TypeKind kind;
     int block;
-    const struct tagType *base;                 // For pointers, arrays, maps and fibers (for maps, denotes the tree node type; for fibers, denotes the fiber closure type)
     int numItems;                               // For arrays, structures and interfaces
     bool isExprList;                            // For structures that represent expression lists
-    bool isVariadicParamList;                   // For dynamic arrays of interfaces that represent variadic parameter lists
+    bool isVariadicParamList;                   // For dynamic arrays that represent variadic parameter lists
     bool isEnum;                                // For enumerations
+    bool isGarbageCollected;
+    bool resolveByStructured;                   // For forward types that should be resolved by a structured type (used for function results)   
     const struct tagIdent *typeIdent;           // For types that have identifiers
     const struct tagType *sameAs;               // For types declared as type T = ...
     union
     {
+        const struct tagType *base;             // For pointers (value type), arrays (item type), maps (node type) and fibers (closure type)
         const Field **field;                    // For structures, interfaces and closures
         const EnumConst **enumConst;            // For enumerations
-        Signature sig;                          // For functions, including methods
+        Signature *sig;                         // For functions, including methods
     };
     int size;
     int alignment;
@@ -183,7 +183,26 @@ typedef struct tagVisitedTypePair
 
 typedef struct
 {
+    const Type
+        *voidType,
+        *nullType,
+        *int8Type,  *int16Type,  *int32Type,  *intType,
+        *uint8Type, *uint16Type, *uint32Type, *uintType,
+        *boolType,
+        *charType,
+        *real32Type, *realType,
+        *strType,
+        *fiberType,
+        *ptrVoidType, *ptrNullType,
+        *anyType,
+        *fileType;
+} PredeclaredTypes;
+
+
+typedef struct
+{
     const Type *first;
+    PredeclaredTypes predecl;
     bool forwardTypesEnabled;
     Storage *storage;
     Error *error;
@@ -200,7 +219,7 @@ typedef enum
 } FormatStringTypeSize;
 
 
-void typeInit(Types *types, Storage *storage, Error *error);
+void typeInit(Types *types, const Blocks *blocks, Storage *storage, Error *error);
 
 Type *typeAdd       (Types *types, const Blocks *blocks, TypeKind kind);
 void typeDeepCopy   (Storage *storage, Type *dest, const Type *src);
@@ -278,21 +297,7 @@ static inline bool typeStructured(const Type *type)
 }
 
 
-static inline bool typeKindGarbageCollected(TypeKind typeKind)
-{
-    return typeKind == TYPE_PTR    ||
-           typeKind == TYPE_STR    || typeKind == TYPE_ARRAY     || typeKind == TYPE_DYNARRAY || typeKind == TYPE_MAP ||
-           typeKind == TYPE_STRUCT || typeKind == TYPE_INTERFACE || typeKind == TYPE_CLOSURE  || typeKind == TYPE_FIBER;
-}
-
-
 bool typeHasPtr(const Type *type, bool alsoWeakPtr);
-
-
-static inline bool typeGarbageCollected(const Type *type)
-{
-    return typeHasPtr(type, false);
-}
 
 
 static inline bool typeExprListStruct(const Type *type)
@@ -406,6 +411,17 @@ static inline bool typeOverflow(TypeKind typeKind, Const val)
 }
 
 
+static inline void typeSetBase(Type *type, const Type *base)
+{
+    if (type->kind == TYPE_PTR || type->kind == TYPE_WEAKPTR || type->kind == TYPE_ARRAY || type->kind == TYPE_DYNARRAY || type->kind == TYPE_MAP || type->kind == TYPE_FIBER)
+    {
+        type->base = base;
+        if (type->kind == TYPE_ARRAY && base->isGarbageCollected)
+            type->isGarbageCollected = true;
+    }
+}
+
+
 static inline void typeResizeArray(Type *type, int numItems)
 {
     if (type->kind == TYPE_ARRAY)
@@ -419,7 +435,8 @@ static inline void typeResizeArray(Type *type, int numItems)
 
 static inline Type typeMakeDetachedArray(const Type *base, int numItems)
 {
-    Type type = {.kind = TYPE_ARRAY, .base = base};
+    Type type = {.kind = TYPE_ARRAY};
+    typeSetBase(&type, base);
     typeResizeArray(&type, numItems);
     return type;
 }
@@ -441,8 +458,7 @@ int typeParamSizeUpTo   (const Types *types, const Signature *sig, int index);
 int typeParamSizeTotal  (const Types *types, const Signature *sig);
 int typeParamOffset     (const Types *types, const Signature *sig, int index);
 
-const ParamLayout            *typeMakeParamLayout           (const Types *types, const Signature *sig);
-const ParamAndLocalVarLayout *typeMakeParamAndLocalVarLayout(const Types *types, const ParamLayout *paramLayout, int localVarSlots);
+const StackFrameLayout *typeMakeStackFrameLayout(const Types *types, const Signature *sig, int64_t localVarSlots);
 
 const char *typeKindSpelling(TypeKind kind);
 const char *typeSpelling    (const Type *type, char *buf);

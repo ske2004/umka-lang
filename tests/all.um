@@ -1,4 +1,5 @@
 import (
+    "parsing.um"
     "print.um"
     "binfileio.um"
     "dynarrays.um"
@@ -6,12 +7,14 @@ import (
     "dynarrays3.um"
     "strings.um"
     "fibers.um"
+    "fibers2.um"
     "fnctools.um"
     "gc.um"
     "gc2.um"
     "interfaces.um"
     "interfaces2.um"
     "interfaces3.um"
+    "interfaces4.um"
     "maps.um"
     "maps2.um"
     "multret.um"
@@ -53,6 +56,7 @@ import (
 )
 
 fn main() {
+    printf("\n\n>>> Parsing\n\n");                  parsing::test()
     printf("\n\n>>> Printing\n\n");                 print::test()
     printf("\n\n>>> Binary file I/O\n\n");          binfileio::test()
     printf("\n\n>>> Dynamic arrays - 1\n\n");       dynarrays::test()
@@ -60,12 +64,14 @@ fn main() {
     printf("\n\n>>> Dynamic arrays - 3\n\n");       dynarrays3::test()
     printf("\n\n>>> Strings\n\n");                  strings::test()
     printf("\n\n>>> Fibers\n\n");                   fibers::test()
+    printf("\n\n>>> Fibers - 2\n\n");               fibers2::test()
     printf("\n\n>>> Functional tools\n\n");         fnctools::test()
     printf("\n\n>>> Garbage collection - 1\n\n");   gc::test()
     printf("\n\n>>> Garbage collection - 2\n\n");   gc2::test()
     printf("\n\n>>> Interfaces - 1\n\n");           interfaces::test()
     printf("\n\n>>> Interfaces - 2\n\n");           interfaces2::test()
     printf("\n\n>>> Interfaces - 3\n\n");           interfaces3::test()
+    printf("\n\n>>> Interfaces - 4\n\n");           interfaces4::test()    
     printf("\n\n>>> Maps - 1\n\n");                 maps::test()
     printf("\n\n>>> Maps - 2\n\n");                 maps2::test()
     printf("\n\n>>> Multiple returns\n\n");         multret::test()

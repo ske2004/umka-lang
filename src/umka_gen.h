@@ -44,6 +44,7 @@ typedef struct
 
 
 void genInit(CodeGen *gen, Storage *storage, DebugInfo *debug, Error *error);
+void genResetOptimizer(CodeGen *gen);
 
 // Atomic VM instructions
 
@@ -53,6 +54,7 @@ void genPushIntConst    (CodeGen *gen, int64_t intVal);
 void genPushUIntConst   (CodeGen *gen, uint64_t uintVal);
 void genPushRealConst   (CodeGen *gen, double realVal);
 void genPushGlobalPtr   (CodeGen *gen, void *ptrVal);
+void genPushGlobal      (CodeGen *gen, TypeKind typeKind, void *ptrVal);
 void genPushLocalPtr    (CodeGen *gen, int offset);
 void genPushLocalPtrZero(CodeGen *gen, int offset, int size);
 void genPushLocal       (CodeGen *gen, TypeKind typeKind, int offset);
@@ -72,12 +74,12 @@ void genAssign       (CodeGen *gen, TypeKind typeKind, int structSize);
 void genSwapAssign   (CodeGen *gen, TypeKind typeKind, int structSize);
 void genAssignParam  (CodeGen *gen, TypeKind typeKind, int structSize);
 
-void genChangeRefCnt            (CodeGen *gen, TokenKind tokKind, const Type *type);
-void genChangeRefCntGlobal      (CodeGen *gen, TokenKind tokKind, void *ptrVal, const Type *type);
-void genChangeRefCntLocal       (CodeGen *gen, TokenKind tokKind, int offset, const Type *type);
-void genChangeRefCntAssign      (CodeGen *gen, const Type *type);
-void genSwapChangeRefCntAssign  (CodeGen *gen, const Type *type);
-void genChangeLeftRefCntAssign  (CodeGen *gen, const Type *type);
+void genRefCnt            (CodeGen *gen, TokenKind tokKind, const Type *type);
+void genRefCntGlobal      (CodeGen *gen, TokenKind tokKind, void *ptrVal, const Type *type);
+void genRefCntLocal       (CodeGen *gen, TokenKind tokKind, int offset, const Type *type);
+void genRefCntAssign      (CodeGen *gen, const Type *type);
+void genSwapRefCntAssign  (CodeGen *gen, const Type *type);
+void genLeftRefCntAssign  (CodeGen *gen, const Type *type);
 
 void genUnary (CodeGen *gen, TokenKind tokKind, const Type *type);
 void genBinary(CodeGen *gen, TokenKind tokKind, const Type *type);
@@ -104,7 +106,7 @@ void genCallBuiltin         (CodeGen *gen, TypeKind typeKind, BuiltinFunc builti
 void genCallTypedBuiltin    (CodeGen *gen, const Type *type, BuiltinFunc builtin);
 void genReturn              (CodeGen *gen, int paramSlots);
 
-void genEnterFrame(CodeGen *gen, const ParamAndLocalVarLayout *layout);
+void genEnterFrame(CodeGen *gen, const StackFrameLayout *layout);
 void genLeaveFrame(CodeGen *gen);
 
 void genHalt(CodeGen *gen);
@@ -138,7 +140,7 @@ void genShortCircuitProlog(CodeGen *gen);
 void genShortCircuitEpilog(CodeGen *gen, TokenKind op);
 
 void genEnterFrameStub (CodeGen *gen);
-void genLeaveFrameFixup(CodeGen *gen, const ParamAndLocalVarLayout *layout);
+void genLeaveFrameFixup(CodeGen *gen, const StackFrameLayout *layout);
 
 void genEntryPoint(CodeGen *gen, int start);
 
@@ -151,6 +153,6 @@ void genGotosEpilog (CodeGen *gen, Gotos *gotos);
 void genCopyResultToTempVar(CodeGen *gen, const Type *type, int offset);
 int  genTryRemoveCopyResultToTempVar(CodeGen *gen);
 
-int genAsm(CodeGen *gen, char *buf, int size);
+int genAsm(CodeGen *gen, const Idents *idents, char *buf, int size);
 
 #endif // UMKA_GEN_H_INCLUDED

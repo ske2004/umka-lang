@@ -55,7 +55,7 @@ fn stderror(code: StdErr): Err {
 fn exitif*(err: Err) {
     if err.code != 0 {
         msg := sprintf("%s (code %d) in %v\n", err.msg, err.code, err.sender)
-        msg += sprintf("Stack trace:\n")
+        msg += sprintf("Occurred at:\n")
         for _, pos in err.trace {
             msg += sprintf("    %s: %s (%d)\n", pos.func, pos.file, pos.line)
         }
@@ -127,11 +127,23 @@ fn stderr*(): File {
     return rtlstderr()
 }
 
+fopenModes := [15]str{
+    "r", "w", "a", 
+    "rb", "wb", "ab", 
+    "r+", "w+", "a+", 
+    "r+b", "rb+", "w+b", "wb+", "a+b", "ab+"
+}
+
 fn rtlfopen(name: str, mode: str): File
 
 fn fopen*(name: str, mode: str): (File, Err) {
-    f := rtlfopen(name, mode)
-    return f, f != null ? stderror(.ok) : stderror(.nullf)
+    for _, fopenMode in fopenModes {
+        if mode == fopenMode {
+            f := rtlfopen(name, mode)
+            return f, f != null ? stderror(.ok) : stderror(.nullf)
+        }
+    }
+    return null, stderror(.nullf)
 }
 
 fn rtlfclose(f: File): int
@@ -225,6 +237,9 @@ fn freadall*(f: File): ([]char, Err) {
     size, err := ftell(f)
     if err.code != 0 {
         return {}, err
+    }
+    if size > 0x7FFFFF00 {
+        return {}, stderror(.eof)
     }
     err = fseek(f, 0, .begin)
     if err.code != 0 {

@@ -23,6 +23,8 @@ Umka is a statically typed embeddable scripting language. It combines simplicity
   * [Vim](https://github.com/marekmaskarinec/vim-umka)
   * [Kakoune](https://github.com/thacuber2a03/highlighters.kak/blob/main/umka.kak)
   * [Emacs](https://github.com/rexim/umka-mode)
+  * [Unreal Engine](https://github.com/Solessfir/UEmka)
+  * [Zed](https://github.com/michabay05/zed-umka)
 * [Community](https://discord.gg/PcT7cn59h9)
 
 ## Features
@@ -69,9 +71,12 @@ _400 x 400 matrix multiplication (AMD A4-3300M @ 1.9 GHz, Windows 7)_
 ## Projects in Umka
 
 * [tophat](https://tophat2d.dev/): A 2D game framework focused on minimalism
-* [SaveScum](https://skejeton.itch.io/savescum): A tophat-based puzzle platformer game 
 
 ![](resources/tophat.png)
+
+* [SaveScum](https://skejeton.itch.io/savescum): A tophat-based puzzle platformer game 
+
+![](resources/savescum.png)
 
 * [Money, please!](https://skejeton.itch.io/moneyplease): A visual novel/puzzle game. Designed and developed in 96 hours for GMTK Game Jam 2024
 
@@ -92,6 +97,18 @@ _400 x 400 matrix multiplication (AMD A4-3300M @ 1.9 GHz, Windows 7)_
 * [Umka OS](https://github.com/skejeton/umka-os): A proof of concept operating system written in C and Umka
 
 ![](resources/os.png)
+
+* [buum](https://github.com/marekmaskarinec/buum): A build system with Umka scripting, used in tophat
+
+![](resources/buum.png)
+
+* [kilocat](https://github.com/thacuber2a03/kilocat): A port of the [kilo](https://github.com/antirez/kilo) text editor
+
+![](resources/kilocat.png)
+
+* [limeka](https://github.com/kryffon/limeka): A port of the [lite](https://github.com/rxi/lite) text editor
+
+![](resources/limeka.png)
 
 * [VDrift/Umka](https://github.com/vtereshkov/vdrift): A racing simulator that lets you design, tune and test your own car autopilot
 
@@ -265,10 +282,10 @@ for i := 0; i < 10; i++ {
 While Go is a compiled systems programming language with a complex runtime library and big output binaries, Umka is a scripting language with a lightweight interpreter that can be easily embedded into any application as a shared library.
 
 ### Syntax
-Umka is very similar to Go syntactically. However, in some aspects it's different. It has shorter keywords: `fn` for `func`, `str` for `string`, `in` for `range`. For better readability, it requires a `:` between variable names and types in declarations. It doesn't follow the [unfortunate C tradition](https://blog.golang.org/declaration-syntax) of pointer dereferencing. Instead of `*p`, it uses the Pascal syntax `p^`. As the `*` character is no longer used for pointers, it becomes the export mark, like in Oberon, so that a programmer can freely use upper/lower case letters in identifiers according to his/her own style. Type assertions don't have any special syntax; they look like pointer type casts. Closure definitions require explicit lists of captured variables.
+Umka is very similar to Go syntactically. However, in some aspects it's different. It has shorter keywords and identifiers: `fn` for `func`, `in` for `range`, `str` for `string`. For better readability, it requires a `:` between variable names and types in declarations. It doesn't follow the [unfortunate C tradition](https://blog.golang.org/declaration-syntax) of pointer dereferencing. Instead of `*p`, it uses the Pascal syntax `p^`. As the `*` character is no longer used for pointers, it becomes the export mark, like in Oberon, so that a programmer can freely use upper/lower case letters in identifiers according to his/her own style. Type assertions don't have any special syntax; they look like pointer type casts. Closure definitions require explicit lists of captured variables.
 
 ### Semantics
-Umka allows implicit type casts and supports default parameters in function declarations. It features the ternary conditional operator deliberately omitted from Go. It doesn't have slices as separate data types. Instead, it supports dynamic arrays, which are declared like Go's slices and initialized by calling `make()`. Method receivers must be pointers. The multithreading model in Umka is inspired by Lua and Wren rather than Go. It offers lightweight threads called fibers instead of goroutines and channels. The garbage collection mechanism is based on reference counting, so Umka needs to support `weak` pointers. Full Unicode support is under development.
+Umka allows implicit type casts and supports default parameters in function declarations. It features the ternary conditional operator deliberately omitted from Go. It doesn't have slices as separate data types. Instead, it supports dynamic arrays, which are declared like Go's slices and initialized by calling `make()`. Method receivers must be pointers. The multithreading model in Umka is inspired by Lua and Wren rather than Go. It offers lightweight threads called fibers instead of goroutines and channels. The garbage collection mechanism is based on reference counting, so Umka needs to support `weak` pointers.
 
 ## Reviews
 * [Tsoding Daily](https://www.youtube.com/watch?v=wRnJgrOcjqg)

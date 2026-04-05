@@ -8,7 +8,7 @@
 #include "umka_compiler.h"
 #include "umka_api.h"
 
-#define UMKA_VERSION    "1.5.5"
+#define UMKA_VERSION    "1.5.6"
 
 
 static void compileWarning(Umka *umka, const DebugInfo *debug, const char *format, ...)
@@ -165,7 +165,7 @@ UMKA_API bool umkaAddModule(Umka *umka, const char *fileName, const char *source
 
 UMKA_API bool umkaAddFunc(Umka *umka, const char *name, UmkaExternFunc func)
 {
-    return compilerAddFunc(umka, name, func);
+    return compilerAddClosure(umka, name, func, NULL);
 }
 
 
@@ -177,7 +177,7 @@ UMKA_API bool umkaGetFunc(Umka *umka, const char *moduleName, const char *fnName
 
 UMKA_API bool umkaGetCallStack(Umka *umka, int depth, int nameSize, int *offset, char *fileName, char *fnName, int *line)
 {
-    Slot *base = umka->vm.fiber->base;
+    const Slot *base = umka->vm.fiber->base;
     int ip = umka->vm.fiber->ip;
 
     while (depth-- > 0)
@@ -214,13 +214,13 @@ UMKA_API void *umkaAllocData(Umka *umka, int size, UmkaExternFunc onFree)
 
 UMKA_API void umkaIncRef(Umka *umka, void *ptr)
 {
-    vmIncRef(&umka->vm, ptr, umka->ptrVoidType);    // We have no actual type info provided by the user, so we can only rely on the type info from the heap chunk header, if any
+    vmIncRef(&umka->vm, ptr, umka->types.predecl.ptrVoidType);    // We have no actual type info provided by the user, so we can only rely on the type info from the heap chunk header, if any
 }
 
 
 UMKA_API void umkaDecRef(Umka *umka, void *ptr)
 {
-    vmDecRef(&umka->vm, ptr, umka->ptrVoidType);    // We have no actual type info provided by the user, so we can only rely on the type info from the heap chunk header, if any
+    vmDecRef(&umka->vm, ptr, umka->types.predecl.ptrVoidType);    // We have no actual type info provided by the user, so we can only rely on the type info from the heap chunk header, if any
 }
 
 
@@ -285,7 +285,7 @@ UMKA_API void umkaMakeFuncContext(Umka *umka, const UmkaType *closureType, int e
 
 UMKA_API UmkaStackSlot *umkaGetParam(UmkaStackSlot *params, int index)
 {
-    const ParamLayout *paramLayout = *vmGetParamLayout(params);
+    const ParamLayout *paramLayout = getParamLayout(*vmGetStackFrameLayout(params));
     if (index < 0 || index >= paramLayout->numParams - paramLayout->numResultParams - 1)
         return NULL;
     return params + paramLayout->firstSlotIndex[index + 1];                                                 // + 1 to skip upvalues
@@ -294,14 +294,14 @@ UMKA_API UmkaStackSlot *umkaGetParam(UmkaStackSlot *params, int index)
 
 UMKA_API UmkaAny *umkaGetUpvalue(UmkaStackSlot *params)
 {
-    const ParamLayout *paramLayout = *vmGetParamLayout(params);
+    const ParamLayout *paramLayout = getParamLayout(*vmGetStackFrameLayout(params));
     return (UmkaAny *)(params + paramLayout->firstSlotIndex[0]);
 }
 
 
 UMKA_API UmkaStackSlot *umkaGetResult(UmkaStackSlot *params, UmkaStackSlot *result)
 {
-    const ParamLayout *paramLayout = *vmGetParamLayout(params);
+    const ParamLayout *paramLayout = getParamLayout(*vmGetStackFrameLayout(params));
     if (paramLayout->numResultParams == 1)
         result->ptrVal = params[paramLayout->firstSlotIndex[paramLayout->numParams - 1]].ptrVal;
     return result;
@@ -336,15 +336,50 @@ UMKA_API const UmkaType *umkaGetBaseType(const UmkaType *type)
 
 UMKA_API const UmkaType *umkaGetParamType(UmkaStackSlot *params, int index)
 {
-    const ParamLayout *paramLayout = *vmGetParamLayout(params);
+    const StackFrameLayout *layout = *vmGetStackFrameLayout(params);
+    const ParamLayout *paramLayout = getParamLayout(layout);
     if (index < 0 || index >= paramLayout->numParams - paramLayout->numResultParams - 1)
         return NULL;
-    return PARAM_LAYOUT_TYPES(paramLayout)->paramType[index + 1]; 
+    return getParamTypes(layout)->paramType[index + 1]; 
 }
 
 
 UMKA_API const UmkaType *umkaGetResultType(UmkaStackSlot *params, UmkaStackSlot *result)
 {
-    const ParamLayout *paramLayout = *vmGetParamLayout(params);
-    return PARAM_LAYOUT_TYPES(paramLayout)->resultType;
+    const StackFrameLayout *layout = *vmGetStackFrameLayout(params);
+    return getParamTypes(layout)->resultType;
+}
+
+
+UMKA_API const UmkaType *umkaGetFieldType(const UmkaType *structType, const char *fieldName)
+{
+    if (structType->kind == TYPE_STRUCT)
+    {
+        const Field *field = typeFindField(structType, fieldName, NULL);
+        if (field)
+            return field->type;
+    }
+    return NULL;
+}
+
+
+UMKA_API const UmkaType *umkaGetMapKeyType(const UmkaType *mapType)
+{
+    if (mapType->kind == TYPE_MAP)
+        return typeMapKey(mapType);
+    return NULL;
+}
+
+
+UMKA_API const UmkaType *umkaGetMapItemType(const UmkaType *mapType)
+{
+    if (mapType->kind == TYPE_MAP)
+        return typeMapItem(mapType);
+    return NULL;
+}
+
+
+UMKA_API bool umkaAddClosure(Umka *umka, const char *name, UmkaExternFunc func, void *upvalue)
+{
+    return compilerAddClosure(umka, name, func, upvalue);
 }

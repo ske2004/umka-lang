@@ -24,7 +24,6 @@ typedef enum
     TOK_IN,
     TOK_MAP,
     TOK_RETURN,
-    TOK_STR,
     TOK_STRUCT,
     TOK_SWITCH,
     TOK_TYPE,
@@ -108,11 +107,7 @@ typedef struct
     TokenKind kind;
     union
     {
-        struct
-        {
-            IdentName name;
-            unsigned int hash;
-        };
+        IdentName name;
         int64_t intVal;
         uint64_t uintVal;
         double realVal;

@@ -1,10 +1,18 @@
 
 
+>>> Parsing
+
+OK
+OK
+OK
+
+
 >>> Printing
 
 7 [42 43] 6.000000 {"Hello": 3.14 "World": 0.333333}
 7 [42 43] 6.000000 {"Hello": 3.14 "World": 0.333333}
 7 [42 43] 6.000000 {"Hello": 3.14 "World": 0.333333}
+п
 
 
 >>> Binary file I/O
@@ -129,6 +137,9 @@ Slicing...
 []
 Copying...
 [[5 7] [10 12]] [[5 7] [9 11]]
+Conversions...
+[1 2]
+[1 2]
 
 
 >>> Dynamic arrays - 2
@@ -276,6 +287,11 @@ Parent: i=8 b=12
 Parent: i=9 b=12
 
 
+>>> Fibers - 2
+
+42
+
+
 >>> Functional tools
 
 Array = [3 7 1 -4 2 5]
@@ -320,6 +336,12 @@ woof
 meow
 meow
 woof
+
+
+>>> Interfaces - 4
+
+{min: [3 3] max: [8 8]}
+{parts: [{min: [3 3] max: [8 8]} {min: [5 5] max: [7 9]}]}
 
 
 >>> Maps - 1
@@ -688,7 +710,7 @@ Error: Empty string (code -2) from "foo":
     foo: (5)
     fooTest: (11)
     test: (25)
-    main: (74)
+    main: (80)
 9
 
 
@@ -961,10 +983,36 @@ Fibonacci number 10 = 55
 s2 = 
 "" "" "" "Hello "
 []
-len = 0, 6
+len = 0, 6  cap = 0, 7
 Hello 
 true false true
 false true false
+"" "" "Hello " "Hello "
+true false true
+true false true
+"!!!" "" "Hello ???" "Hello "
+false true false
+false true false
+  1   4 x
+  2   4 xx
+  3   4 xxx
+  4  10 xxxx
+  5  10 xxxxx
+  6  10 xxxxxx
+  7  10 xxxxxxx
+  8  10 xxxxxxxx
+  9  10 xxxxxxxxx
+ 10  22 xxxxxxxxxx
+ 11  22 xxxxxxxxxxx
+ 12  22 xxxxxxxxxxxx
+ 13  22 xxxxxxxxxxxxx
+ 14  22 xxxxxxxxxxxxxx
+ 15  22 xxxxxxxxxxxxxxx
+ 16  22 xxxxxxxxxxxxxxxx
+ 17  22 xxxxxxxxxxxxxxxxx
+ 18  22 xxxxxxxxxxxxxxxxxx
+ 19  22 xxxxxxxxxxxxxxxxxxx
+ 20  22 xxxxxxxxxxxxxxxxxxxx
 
 []
 len = 0  cap = 0
@@ -1101,6 +1149,7 @@ str: 425 + 5 = 4255
 []real: [42 5] + [5] = [42 5 5]
 unknown: 42
 
+hi
 
 
 >>> Redeclarations
@@ -1345,3 +1394,15 @@ true
 [0 1 4 9 16 25 36 49 64]
 [0 1 4 9 16 25 36 49 64 81]
 [0 1 4 9 16 25 36 49 64 81 100]
+{[] false}
+{[0] true}
+{[0 1] true}
+{[0 1 4] true}
+{[0 1 4 9] true}
+{[0 1 4 9 16] true}
+{[0 1 4 9 16 25] true}
+{[0 1 4 9 16 25 36] true}
+{[0 1 4 9 16 25 36 49] true}
+{[0 1 4 9 16 25 36 49 64] true}
+{[0 1 4 9 16 25 36 49 64 81] true}
+{[0 1 4 9 16 25 36 49 64 81 100] true}

@@ -166,6 +166,20 @@ Parameters:
 Returned value: `true` if the function has been successfully added.
 
 ```
+UMKA_API bool umkaAddClosure(Umka *umka, const char *name, UmkaExternFunc func, void *upvalue);
+```
+Adds a C/C++ function to the list of external functions that can be called from Umka. The `upvalue` parameter is a pointer to any user data that should be available inside `func` as a captured variable and accessible via `umkaGetUpvalue`.
+
+Parameters:
+
+* `umka` Interpreter instance handle
+* `name` Function name
+* `func` Function pointer
+* `upvalue` User data pointer
+
+Returned value: `true` if the function has been successfully added.
+
+```
 UMKA_API bool umkaGetFunc(Umka *umka, const char *moduleName, const char *fnName, 
                           UmkaFuncContext *fn);
 ```
@@ -217,6 +231,26 @@ Parameters:
 
 Returned value: Pointer to the first stack slot occupied by the parameter, `NULL` if there is no such parameter.
 
+Notes:
+
+* Parameters of all ordinal types except `uint` are stored in the `intVal` field of the parameter slot
+
+* Parameters of type `uint` are stored in the `uintVal` field of the parameter slot
+
+* Parameters of type `real` are stored in the `realVal` field of the parameter slot
+
+* Parameters of type `real32` are stored in the `real32Val` field of the parameter slot
+
+* Parameters of all pointer types are stored in the `ptrVal` field of the parameter slot
+
+* Parameters of type `str` are stored in the `ptrVal` field of the parameter value slot, treated as being of type `const unsigned char *`
+
+* Parameters of all structured types `T` occupy as many slots as needed to store `sizeof(T)` bytes, each slot being 8 bytes. The first occupied slot is returned by `umkaGetParam`. It follows that:
+
+  * If a parameter is of type `T`, it is accessible as `*(T *)umkaGetParam(params, index)`
+
+  * If a parameter is of type `^T`, it is accessible as `(T *)umkaGetParam(params, index)->ptrVal`  
+
 ```
 UMKA_API UmkaAny *umkaGetUpvalue(UmkaStackSlot *params);
 ```
@@ -238,11 +272,27 @@ Parameters:
 * `params`: Parameter stack slots
 * `result`: Returned value stack slots
 
-Returned value: Pointer to the stack slot allocated for storing the returned value. Special rules apply to a returned value of a structured type or to multiple returned values (treated as a single implicit structure):
+Returned value: Pointer to the stack slot allocated for storing the returned value. 
 
-* Inside a C function called from Umka, this stack slot already contains the pointer to the memory area sufficiently large to store the actual returned value. The user must fill this memory area, but not rewrite the pointer
+Notes:
 
-* Before calling an Umka function from C, the user must allocate a memory area needed for storing the actual returned value and put the area pointer to the stack slot returned by `umkaGetResult`
+* Returned values of all ordinal types except `uint` are stored in the `intVal` field of the returned value slot
+
+* Returned values of type `uint` are stored in the `uintVal` field of the returned value slot
+
+* Returned values of types `real` and `real32` are stored in the `realVal` field of the returned value slot
+
+* Returned values of all pointer types are stored in the `ptrVal` field of the returned value slot
+
+* Returned values of type `str` are stored in the `ptrVal` field of the returned value slot, treated as being of type `const unsigned char *`
+
+* Returned values of all structured types `T` are assumed to be allocated by the caller. The pointer to allocated memory is stored in the `ptrVal` field of the returned value slot, treated as being of type `T *`. In particular:
+
+  * Inside a C function called from Umka, the returned value is allocated by the Umka interpreter. The C function must put the returned value to allocated memory, but must not overwrite the pointer
+
+  * Before calling an Umka function from C, the C program must allocate memory needed for storing the returned value and put the pointer into the `ptrVal` field of the returned value slot
+
+* Multiple returned values of types `(T0, T1 /*...*/)`are treated as a single structure `struct {item0: T0; item1: T1 /*...*/}` and follow the rules for structured types
 
 ```
 static inline Umka *umkaGetInstance(UmkaStackSlot *result);
@@ -467,6 +517,40 @@ Parameters:
 * `type`: Pointer, array or dynamic array type
 
 Returned value: Base type of a pointer type; item type of an array or dynamic array type; `NULL` otherwise.
+
+```
+UMKA_API const UmkaType *umkaGetFieldType(const UmkaType *structType, const char *fieldName);
+```
+Returns structure field type.
+
+Parameters:
+
+* `structType`: Structure type
+* `fieldName`: Field name
+
+Returned value: Field type; `NULL` if `structType` is not a structure type or has no field `fieldName`.
+
+```
+UMKA_API const UmkaType *umkaGetMapKeyType(const UmkaType *mapType);
+```
+Returns map key type.
+
+Parameters:
+
+* `mapType`: Map type
+
+Returned value: Key type; `NULL` if `mapType` is not a map type.
+
+```
+UMKA_API const UmkaType *umkaGetMapItemType(const UmkaType *mapType);
+```
+Returns map item type.
+
+Parameters:
+
+* `mapType`: Map type
+
+Returned value: Item type; `NULL` if `mapType` is not a map type.
 
 ```
 UMKA_API void *umkaAllocData(Umka *umka, int size, UmkaExternFunc onFree);

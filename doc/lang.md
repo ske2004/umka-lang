@@ -16,7 +16,7 @@ Keywords have special meaning and cannot be used in any other role. Umka has the
 
 ```
 break case const continue default else enum fn for import 
-interface if in map return str struct switch type var weak
+interface if in map return struct switch type var weak
 ```
 
 ### Identifiers
@@ -136,7 +136,7 @@ Umka uses semicolons as statement terminators. To reduce the number of semicolon
 
 * An identifier
 * A number, character literal or string literal
-* `str`,  `break`,  `continue` or `return`
+* `break`,  `continue` or `return`
 * `++`, `--`, `)`, `]`, `}`or `^`
 * `*` as an export mark 
 
@@ -165,7 +165,7 @@ Umka is a statically typed language. Each variable or constant has a type that i
 Syntax:
 
 ```
-type = qualIdent | ptrType | arrayType | dynArrayType | strType | enumType | 
+type = qualIdent | ptrType | arrayType | dynArrayType | enumType | 
        mapType | structType | interfaceType | closureType.
 ```
 
@@ -235,15 +235,9 @@ weak ^Vec
 
 ### String type
 
-A string is a sequence of UTF-8 characters. Its length is not fixed at compile time and can change at run time due to concatenation by using the  `+` operator.
+Umka supports the string type `str`. A string is a sequence of UTF-8 characters terminated by the `'\0'` character. 
 
-Syntax:
-
-```
-strType = "str"
-```
-
-String assignment copies the contents of the string.
+String assignment copies the pointer, but not the contents of the string.
 
 ### Array types
 
@@ -367,8 +361,9 @@ The type of the last parameter in the function signature may be prefixed with `.
 Syntax:
 
 ```
-signature = "(" [typedIdentList ["=" expr] {"," typedIdentList ["=" expr]}] ")" 
-            [":" (type | "(" type {"," type} ")")].
+typedParamList = identList ":" [".."] type.
+signature      = "(" [typedParamList ["=" expr] {"," typedParamList ["=" expr]}] ")" 
+                 [":" (type | "(" type {"," type} ")")].
 ```
 
 Each function definition in the module scope defines a constant of a function type. A constant or variable of a function type cannot be declared using a `const` or `var` declaration, which produce a closure type instead.   
@@ -470,7 +465,15 @@ If a value `s` of type `S` is given where a value `t` of some other type `T` is 
 
 ## Declarations
 
-All types, constants, variables and functions should be declared before the first use. As an exception, a pointer base type, a dynamic array base type or a map item type may be declared after using the pointer type, the dynamic array type or the map type, respectively, but before the end of the same `type` declaration list. No identifier may be declared twice in the same block, except for redeclarations allowed in multi-value short variable declarations.
+All types, constants, variables and functions should be declared before the first use. 
+
+As an exception, a type may be declared after using it, but before the end of the same `type` declaration list, if this type is only used as
+* A pointer base type
+* A dynamic array base type
+* A map item type 
+* A function parameter type or returned value type
+
+No identifier may be declared twice in the same block, except for redeclarations allowed in multi-value short variable declarations.
 
 Syntax:
 
@@ -519,6 +522,7 @@ uint8 uint16 uint32 uint
 bool
 char
 real32 real
+str
 fiber
 any
 __file
@@ -577,7 +581,7 @@ Syntax:
 ```
 fullVarDecl    = "var" (varDeclItem | "(" {varDeclItem ";"} ")").
 varDeclItem    = typedIdentList "=" exprList.
-typedIdentList = identList ":" [".."] type.
+typedIdentList = identList ":" type.
 identList      = ident exportMark {"," ident exportMark}.
 ```
 
@@ -743,13 +747,16 @@ fn make(fiber, f: fn()): fiber                // (3)
 (3) Constructs a fiber and prepares it for calling the function `f`. The actual execution starts on the first call to `resume`.
 
 ```
-fn copy(a: []T): []T              // (1)
-fn copy(m: map[K]T): map[K]T      // (2)
+fn copy(a: str): str              // (1)
+fn copy(a: []T): []T              // (2)
+fn copy(m: map[K]T): map[K]T      // (3)
 ```
 
-(1) Constructs a copy of the dynamic array `a`.
+(1) Constructs a copy of the string `a`.
 
-(2) Constructs a copy of the map `m`.
+(2) Constructs a copy of the dynamic array `a`.
+
+(3) Constructs a copy of the map `m`.
 
 ```
 fn append(a: []T, x: T): []T                // (1)
@@ -794,13 +801,13 @@ fn sort(d: []T, ascending: bool [, fieldName])  // (2)
 fn len(a: ([...]T | []T | map[K]T | str)): int
 ```
 
-Returns the length of `a`, where `a` can be an array, a dynamic array, a map or a string.
+Returns the length of `a`, where `a` can be an array, a dynamic array, a map or a string. For strings, the length does not include the terminating `'\0'` character.
 
 ```
-fn cap(a: []T): int
+fn cap(a: ([]T | str)): int
 ```
 
-Returns the capacity of the dynamic array `a`, i.e., the number of items for which the space is allocated in `a`.
+Returns the capacity of the dynamic array or string `a`, i.e., the number of items for which memory is allocated in `a`. For strings, the capacity includes the terminating `'\0'` character. 
 
 ```
 fn sizeof(T | a: T): int
@@ -873,6 +880,18 @@ fn memusage(): int
 ```
 
 Returns the allocated heap memory size in bytes.
+
+```
+fn leaksan(level: int)
+```
+
+Sets memory leak sanitizer warnings level:
+
+* 0: No warnings
+* 1: Short warnings (default)
+* 2: Detailed warnings. Each leaked allocation is reported along with the exact source code location
+
+Warnings are output to `stderr` after program termination. All leaked memory is freed regardless of the warnings level.
 
 ```
 fn exit(code: int, msg: str = "")
@@ -1205,7 +1224,9 @@ x[i], x[i + 1] = x[i + 1], x[i]
 
 #### Short assignment
 
-A short assignment combines one of the operators `+`, `-`, `*`, `/`, `%`, `&`, `|`, `~`  with assignment according to the following rule: `a op= b` is equivalent to `a = a op b`. 
+A short assignment combines one of the operators `+`, `-`, `*`, `/`, `%`, `&`, `|`, `~`  with assignment according to the following rule: `a op= b` is equivalent to `a = a op b`.
+
+For strings, as a special case, the short assignment `a += b` appends `b` to the existing string `a` if `len(a) + len(b) < cap(a)`. Otherwise, it constructs a new string `a + b` and assigns it to `a` according to the general rule.
 
 Syntax:
 
@@ -1520,17 +1541,17 @@ varDeclItem         = typedIdentList "=" exprList.
 shortVarDecl        = declAssignmentStmt.
 fnDecl              = "fn" [rcvSignature] ident exportMark signature [block].
 rcvSignature        = "(" ident ":" type ")".
-signature           = "(" [typedIdentList ["=" expr] {"," typedIdentList ["=" expr]}] ")" 
+signature           = "(" [typedParamList ["=" expr] {"," typedParamList ["=" expr]}] ")" 
                       [":" (type | "(" type {"," type} ")")].
 exportMark          = ["*"].
 identList           = ident exportMark {"," ident exportMark}.
-typedIdentList      = identList ":" [".."] type.
-type                = qualIdent | ptrType | arrayType | dynArrayType | strType | enumType | 
+typedIdentList      = identList ":" type.
+typedParamList      = identList ":" [".."] type.
+type                = qualIdent | ptrType | arrayType | dynArrayType | enumType | 
                       mapType | structType | interfaceType | closureType.
 ptrType             = ["weak"] "^" type.
 arrayType           = "[" expr "]" type.
 dynArrayType        = "[" "]" type.
-strType             = "str".
 enumType            = "enum" ["(" type ")"] "{" {enumItem ";"} "}".
 enumItem            = ident ["=" expr].
 mapType             = "map" "[" type "]" type.

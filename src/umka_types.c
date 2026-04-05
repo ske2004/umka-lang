@@ -47,12 +47,67 @@ static int typeSizeRecompute(const Type *type);
 static int typeAlignmentRecompute(const Type *type);
 
 
-void typeInit(Types *types, Storage *storage, Error *error)
+static void typeInitPredeclared(Types *types, const Blocks *blocks)
+{
+    types->predecl.voidType    = typeAdd(types, blocks, TYPE_VOID);
+    types->predecl.nullType    = typeAdd(types, blocks, TYPE_NULL);
+    types->predecl.int8Type    = typeAdd(types, blocks, TYPE_INT8);
+    types->predecl.int16Type   = typeAdd(types, blocks, TYPE_INT16);
+    types->predecl.int32Type   = typeAdd(types, blocks, TYPE_INT32);
+    types->predecl.intType     = typeAdd(types, blocks, TYPE_INT);
+    types->predecl.uint8Type   = typeAdd(types, blocks, TYPE_UINT8);
+    types->predecl.uint16Type  = typeAdd(types, blocks, TYPE_UINT16);
+    types->predecl.uint32Type  = typeAdd(types, blocks, TYPE_UINT32);
+    types->predecl.uintType    = typeAdd(types, blocks, TYPE_UINT);
+    types->predecl.boolType    = typeAdd(types, blocks, TYPE_BOOL);
+    types->predecl.charType    = typeAdd(types, blocks, TYPE_CHAR);
+    types->predecl.real32Type  = typeAdd(types, blocks, TYPE_REAL32);
+    types->predecl.realType    = typeAdd(types, blocks, TYPE_REAL);
+    types->predecl.strType     = typeAdd(types, blocks, TYPE_STR);
+
+    types->predecl.ptrVoidType = typeAddPtrTo(types, blocks, types->predecl.voidType);
+    types->predecl.ptrNullType = typeAddPtrTo(types, blocks, types->predecl.nullType);
+
+    // any
+    Type *anyType = typeAdd(types, blocks, TYPE_INTERFACE);
+
+    typeAddField(types, anyType, types->predecl.ptrVoidType, "#self");
+    typeAddField(types, anyType, types->predecl.ptrVoidType, "#selftype");
+
+    types->predecl.anyType = anyType;
+
+    // fiber
+    Type *fiberType = typeAdd(types, blocks, TYPE_FIBER);
+
+    Type *fnType = typeAdd(types, blocks, TYPE_FN);
+    typeAddParam(types, fnType->sig, types->predecl.anyType, "#upvalues", (Const){0});
+
+    fnType->sig->resultType = types->predecl.voidType;
+
+    Type *fiberClosureType = typeAdd(types, blocks, TYPE_CLOSURE);
+    typeAddField(types, fiberClosureType, fnType, "#fn");
+    typeAddField(types, fiberClosureType, types->predecl.anyType, "#upvalues");
+    
+    typeSetBase(fiberType, fiberClosureType);
+
+    types->predecl.fiberType = fiberType;
+
+    // __file
+    Type *fileDataType = typeAdd(types, blocks, TYPE_STRUCT);
+    typeAddField(types, fileDataType, types->predecl.ptrVoidType, "#stream");
+
+    types->predecl.fileType = typeAddPtrTo(types, blocks, fileDataType);
+}
+
+
+void typeInit(Types *types, const Blocks *blocks, Storage *storage, Error *error)
 {
     types->first = NULL;
     types->forwardTypesEnabled = false;
     types->storage = storage;
     types->error = error;
+
+    typeInitPredeclared(types, blocks);
 }
 
 
@@ -62,7 +117,12 @@ Type *typeAdd(Types *types, const Blocks *blocks, TypeKind kind)
 
     type->kind  = kind;
     type->block = blocks->item[blocks->top].block;
+    type->isGarbageCollected = typeHasPtr(type, false);
     type->sameAs = type;
+
+    if (type->kind == TYPE_FN)
+        type->sig = storageAdd(types->storage, sizeof(Signature));
+
     type->size = typeSizeRecompute(type);
     type->alignment = typeAlignmentRecompute(type);
 
@@ -99,13 +159,13 @@ void typeDeepCopy(Storage *storage, Type *dest, const Type *src)
             dest->enumConst[i] = enumConst;
         }
     }
-    else if (dest->kind == TYPE_FN && dest->sig.numParams > 0)
+    else if (dest->kind == TYPE_FN && dest->sig->numParams > 0)
     {
-        for (int i = 0; i < dest->sig.numParams; i++)
+        for (int i = 0; i < dest->sig->numParams; i++)
         {
             Param *param = storageAdd(storage, sizeof(Param));
-            *param = *(src->sig.param[i]);
-            dest->sig.param[i] = param;
+            *param = *(src->sig->param[i]);
+            dest->sig->param[i] = param;
         }
     }
 }
@@ -114,7 +174,7 @@ void typeDeepCopy(Storage *storage, Type *dest, const Type *src)
 const Type *typeAddPtrTo(Types *types, const Blocks *blocks, const Type *type)
 {
     Type *ptrType = typeAdd(types, blocks, TYPE_PTR);
-    ptrType->base = type;
+    typeSetBase(ptrType, type);
     return ptrType;
 }
 
@@ -122,7 +182,7 @@ const Type *typeAddPtrTo(Types *types, const Blocks *blocks, const Type *type)
 const Type *typeAddWeakPtrTo(Types *types, const Blocks *blocks, const Type *type)
 {
     Type *weakPtrType = typeAdd(types, blocks, TYPE_WEAKPTR);
-    weakPtrType->base = type;
+    typeSetBase(weakPtrType, type);
     return weakPtrType;
 }
 
@@ -358,7 +418,7 @@ static bool typeEquivalentRecursive(const Type *left, const Type *right, Visited
             for (int i = 0; i < left->numItems; i++)
             {
                 // Name
-                if (left->field[i]->hash != right->field[i]->hash || strcmp(left->field[i]->name, right->field[i]->name) != 0)
+                if (strcmp(left->field[i]->name, right->field[i]->name) != 0)
                     return false;
 
                 // Type
@@ -372,33 +432,36 @@ static bool typeEquivalentRecursive(const Type *left, const Type *right, Visited
         else if (left->kind == TYPE_FN)
         {
             // Number of parameters
-            if (left->sig.numParams != right->sig.numParams)
+            if (left->sig->numParams != right->sig->numParams)
                 return false;
 
             // Number of default parameters
-            if (left->sig.numDefaultParams != right->sig.numDefaultParams)
+            if (left->sig->numDefaultParams != right->sig->numDefaultParams)
                 return false;
 
             // Method flag
-            if (left->sig.isMethod != right->sig.isMethod)
+            if (left->sig->isMethod != right->sig->isMethod)
                 return false;
 
-            // Parameters (skip interface method receiver)
-            const int iStart = left->sig.offsetFromSelf == 0 ? 0 : 1;
-            for (int i = iStart; i < left->sig.numParams; i++)
+            // Parameters
+            for (int i = 0; i < left->sig->numParams; i++)
             {
+                // Skip interface method receiver
+                if (i == 0 && left->sig->isInterfaceMethod)
+                    continue;
+                
                 // Type
-                if (!typeEquivalentRecursive(left->sig.param[i]->type, right->sig.param[i]->type, &newPair))
+                if (!typeEquivalentRecursive(left->sig->param[i]->type, right->sig->param[i]->type, &newPair))
                     return false;
 
                 // Default value
-                if (i >= left->sig.numParams - left->sig.numDefaultParams)
-                    if (!typeDefaultParamEqual(&left->sig.param[i]->defaultVal, &right->sig.param[i]->defaultVal, left->sig.param[i]->type))
+                if (i >= left->sig->numParams - left->sig->numDefaultParams)
+                    if (!typeDefaultParamEqual(&left->sig->param[i]->defaultVal, &right->sig->param[i]->defaultVal, left->sig->param[i]->type))
                         return false;
             }
 
             // Result type
-            if (!typeEquivalentRecursive(left->sig.resultType, right->sig.resultType, &newPair))
+            if (!typeEquivalentRecursive(left->sig->resultType, right->sig->resultType, &newPair))
                 return false;
 
             return true;
@@ -559,9 +622,8 @@ const Field *typeFindField(const Type *structType, const char *name, int *index)
 {
     if (structType->kind == TYPE_STRUCT || structType->kind == TYPE_INTERFACE || structType->kind == TYPE_CLOSURE)
     {
-        unsigned int nameHash = hash(name);
         for (int i = 0; i < structType->numItems; i++)
-            if (structType->field[i]->hash == nameHash && strcmp(structType->field[i]->name, name) == 0)
+            if (strcmp(structType->field[i]->name, name) == 0)
             {
                 if (index)
                     *index = i;
@@ -619,7 +681,6 @@ const Field *typeAddField(const Types *types, Type *structType, const Type *fiel
     strncpy(field->name, name, MAX_IDENT_LEN);
     field->name[MAX_IDENT_LEN] = 0;
 
-    field->hash = hash(name);
     field->type = fieldType;
     field->offset = align(minNextFieldOffset, typeAlignment(types, fieldType));
 
@@ -636,6 +697,9 @@ const Field *typeAddField(const Types *types, Type *structType, const Type *fiel
 
     structType->size = align(field->offset + fieldType->size, structType->alignment);
 
+    if (fieldType->isGarbageCollected)
+        structType->isGarbageCollected = true;
+
     return field;
 }
 
@@ -644,9 +708,8 @@ const EnumConst *typeFindEnumConst(const Type *enumType, const char *name)
 {
     if (typeEnum(enumType))
     {
-        unsigned int nameHash = hash(name);
         for (int i = 0; i < enumType->numItems; i++)
-            if (enumType->enumConst[i]->hash == nameHash && strcmp(enumType->enumConst[i]->name, name) == 0)
+            if (strcmp(enumType->enumConst[i]->name, name) == 0)
                 return enumType->enumConst[i];
     }
     return NULL;
@@ -687,7 +750,6 @@ const EnumConst *typeAddEnumConst(const Types *types, Type *enumType, const char
     strncpy(enumConst->name, name, MAX_IDENT_LEN);
     enumConst->name[MAX_IDENT_LEN] = 0;
 
-    enumConst->hash = hash(name);
     enumConst->val = val;
 
     if (enumType->numItems > 0)
@@ -704,9 +766,8 @@ const EnumConst *typeAddEnumConst(const Types *types, Type *enumType, const char
 
 const Param *typeFindParam(const Signature *sig, const char *name)
 {
-    const unsigned int nameHash = hash(name);
     for (int i = 0; i < sig->numParams; i++)
-        if (sig->param[i]->hash == nameHash && strcmp(sig->param[i]->name, name) == 0)
+        if (strcmp(sig->param[i]->name, name) == 0)
             return sig->param[i];
 
     return NULL;
@@ -718,7 +779,7 @@ const Param *typeAddParam(const Types *types, Signature *sig, const Type *type, 
     if (typeFindParam(sig, name))
         types->error->handler(types->error->context, "Duplicate parameter %s", name);
 
-    if (sig->numParams > MAX_PARAMS)
+    if (sig->numParams >= MAX_PARAMS)
         types->error->handler(types->error->context, "Too many parameters");
 
     Param *param = storageAdd(types->storage, sizeof(Param));
@@ -726,7 +787,6 @@ const Param *typeAddParam(const Types *types, Signature *sig, const Type *type, 
     strncpy(param->name, name, MAX_IDENT_LEN);
     param->name[MAX_IDENT_LEN] = 0;
 
-    param->hash = hash(name);
     param->type = type;
     param->defaultVal = defaultVal;
 
@@ -759,33 +819,28 @@ int typeParamOffset(const Types *types, const Signature *sig, int index)
 }
 
 
-const ParamLayout *typeMakeParamLayout(const Types *types, const Signature *sig)
+const StackFrameLayout *typeMakeStackFrameLayout(const Types *types, const Signature *sig, int64_t localVarSlots)
 {
-    ParamLayout *layout = storageAdd(types->storage, PARAM_LAYOUT_SIZE(sig->numParams));
+    StackFrameLayout *layout = storageAdd(types->storage, STACK_FRAME_LAYOUT_SIZE(sig->numParams));
 
-    layout->numParams = sig->numParams;
-    layout->numResultParams = typeStructured(sig->resultType) ? 1 : 0;
-    layout->numParamSlots = typeParamSizeTotal(types, sig) / sizeof(Slot);
+    ParamLayout *paramLayout = (ParamLayout *)getParamLayout(layout);
+
+    paramLayout->numParams = sig->numParams;
+    paramLayout->numResultParams = typeStructured(sig->resultType) ? 1 : 0;
+    paramLayout->numParamSlots = typeParamSizeTotal(types, sig) / sizeof(Slot);
 
     for (int i = 0; i < sig->numParams; i++)
-        layout->firstSlotIndex[i] = typeParamOffset(types, sig, i) / sizeof(Slot) - 2;   // - 2 slots for old base pointer and return address
+        paramLayout->firstSlotIndex[i] = typeParamOffset(types, sig, i) / sizeof(Slot) - 2;   // - 2 slots for old base pointer and return address
 
-    ParamLayoutTypes *layoutTypes = PARAM_LAYOUT_TYPES(layout);
-
+    ParamTypes *layoutTypes = (ParamTypes *)getParamTypes(layout);
     layoutTypes->resultType = sig->resultType;
 
     for (int i = 0; i < sig->numParams; i++)
-        layoutTypes->paramType[i] = sig->param[i]->type;    
+        layoutTypes->paramType[i] = sig->param[i]->type;
+        
+    LocalVarLayout *localVarLayout = (LocalVarLayout *)getLocalVarLayout(layout);
+    localVarLayout->localVarSlots = localVarSlots;
     
-    return layout;
-}
-
-
-const ParamAndLocalVarLayout *typeMakeParamAndLocalVarLayout(const Types *types, const ParamLayout *paramLayout, int localVarSlots)
-{
-    ParamAndLocalVarLayout *layout = storageAdd(types->storage, sizeof(ParamAndLocalVarLayout));
-    layout->paramLayout = paramLayout;
-    layout->localVarSlots = localVarSlots;
     return layout;
 }
 
@@ -835,30 +890,30 @@ static char *typeSpellingRecursive(const Type *type, char *buf, int size, int de
 
             len += snprintf(buf + len, nonneg(size - len), "fn (");
 
-            if (type->sig.isMethod)
+            if (type->sig->isMethod)
             {
                 char paramBuf[DEFAULT_STR_LEN + 1];
-                len += snprintf(buf + len, nonneg(size - len), "%s) (", typeSpellingRecursive(type->sig.param[0]->type, paramBuf, DEFAULT_STR_LEN + 1, depth - 1));
+                len += snprintf(buf + len, nonneg(size - len), "%s) (", typeSpellingRecursive(type->sig->param[0]->type, paramBuf, DEFAULT_STR_LEN + 1, depth - 1));
             }
 
             const int numPreHiddenParams = 1;                                                 // #self or #upvalues
-            const int numPostHiddenParams = typeStructured(type->sig.resultType) ? 1 : 0;     // #result
+            const int numPostHiddenParams = typeStructured(type->sig->resultType) ? 1 : 0;     // #result
 
-            for (int i = numPreHiddenParams; i < type->sig.numParams - numPostHiddenParams; i++)
+            for (int i = numPreHiddenParams; i < type->sig->numParams - numPostHiddenParams; i++)
             {
                 if (i > numPreHiddenParams)
                     len += snprintf(buf + len, nonneg(size - len), ", ");
 
                 char paramBuf[DEFAULT_STR_LEN + 1];
-                len += snprintf(buf + len, nonneg(size - len), "%s", typeSpellingRecursive(type->sig.param[i]->type, paramBuf, DEFAULT_STR_LEN + 1, depth - 1));
+                len += snprintf(buf + len, nonneg(size - len), "%s", typeSpellingRecursive(type->sig->param[i]->type, paramBuf, DEFAULT_STR_LEN + 1, depth - 1));
             }
 
             len += snprintf(buf + len, nonneg(size - len), ")");
 
-            if (type->sig.resultType->kind != TYPE_VOID)
+            if (type->sig->resultType->kind != TYPE_VOID)
             {
                 char resultBuf[DEFAULT_STR_LEN + 1];
-                len += snprintf(buf + len, nonneg(size - len), ": %s", typeSpellingRecursive(type->sig.resultType, resultBuf, DEFAULT_STR_LEN + 1, depth - 1));
+                len += snprintf(buf + len, nonneg(size - len), ": %s", typeSpellingRecursive(type->sig->resultType, resultBuf, DEFAULT_STR_LEN + 1, depth - 1));
             }
 
             if (isClosure)
