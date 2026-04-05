@@ -1,0 +1,42 @@
+import (
+  "std.um"
+  "lib/ser_de.um"
+)
+
+type Settings = struct {
+  username: str
+  brightness: real
+  clockSpeed: real
+}
+
+fn main() {
+  if std::argc() != 3 {
+    printf("usage: %s <from|to> <file>", std::argv(0))
+    exit(1)
+  }
+
+  settings := &Settings{}
+
+  rules := <obj>
+    {&settings.username}
+    <!-- constraints -->
+    <clamp min=0.0 max=1.0>{&settings.brightness}</clamp>
+    <clamp min=50.0 max=622.0>{&settings.clockSpeed}</clamp>
+  </obj>
+
+  if std::argv(1) == "to" {
+    settings ^= {
+      username: "Blah",
+      brightness: 2.0,
+      clockSpeed: 244,
+    }
+
+    printf("Deserializing: %llv\n", settings)
+    std::exitif(ser_de::deser(std::argv(2), rules))
+  } else if std::argv(1) == "from" {
+    std::exitif(ser_de::ser(std::argv(2), rules))
+    printf("Serialized into: %llv\n", settings)
+  } else {
+    exit(1, "Invalid parameter "+std::argv(1))
+  }
+}

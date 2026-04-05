@@ -97,6 +97,25 @@ static void typeInitPredeclared(Types *types, const Blocks *blocks)
     typeAddField(types, fileDataType, types->predecl.ptrVoidType, "#stream");
 
     types->predecl.fileType = typeAddPtrTo(types, blocks, fileDataType);
+    
+    // umx
+    Type *umxType = typeAdd(types, blocks, TYPE_STRUCT);
+
+    Type *umxPropType = typeAdd(types, blocks, TYPE_STRUCT);
+    typeAddField(types, umxPropType, types->predecl.strType, "key");
+    typeAddField(types, umxPropType, types->predecl.anyType, "value");
+
+    Type *umxChildrenArrayType = typeAdd(types, blocks, TYPE_DYNARRAY);
+    umxChildrenArrayType->base = types->predecl.anyType;
+    
+    Type *umxPropArrayType = typeAdd(types, blocks, TYPE_DYNARRAY);
+    umxPropArrayType->base = umxPropType;
+    typeAddField(types, umxType, types->predecl.strType, "tag");
+    typeAddField(types, umxType, umxChildrenArrayType, "children");
+    typeAddField(types, umxType, umxPropArrayType, "props");
+
+    types->predecl.umxType = umxType;
+    types->predecl.umxPropType = umxPropType;
 }
 
 

@@ -1,0 +1,156 @@
+import (
+  "std.um"
+  "lib/util.um"
+)
+
+fn func(f_: any): str
+
+fn getParam(node: umx, name: str): str {
+  if v := ^str(util::findProp(node, name)); v != null {
+    return v^
+  }
+  if v := ^real(util::findProp(node, name)); v != null {
+    return std::ftoa(v^, 5)
+  }
+  if v := ^int(util::findProp(node, name)); v != null {
+    return std::ftoa(v^, 5)
+  }
+  return func(umx(util::findProp(node, name)))
+}
+
+fn getParamNum(node: umx, name: str): real {
+  return std::atof(getParam(node, name))
+}
+
+fn isdigit(s: str): bool {
+  return len(s) >= 1 && s[0] >= '0' && s[1] <= '9'
+}
+
+fn truthy(s: str): bool {
+  return (!isdigit(s) || std::atof(s) != 0) && s != "false" && s != ""
+}
+
+var vars: map[str]str
+
+fn block(f_: umx)
+fn func(f_: any): str {
+  f := umx(f_)
+
+  if f.tag == "set-variable" {
+    vars[str(util::findProp(f, "name"))] = getParam(f, "value")
+    return "true"
+  } else if f.tag == "get-variable" {
+    return vars[str(util::findProp(f, "name"))]
+  } else if f.tag == "check" {
+    if truthy(getParam(f, "condition")) {
+      block(f)
+      return "true"
+    }
+    return "false"
+  } else if f.tag == "block" {
+    block(f)
+    return "true"
+  } else if f.tag == "while" {
+    istruthy := false
+    for truthy(getParam(f, "condition")) {
+      block(f)
+      istruthy := true
+    }
+    return istruthy ? "true" : "false"
+  } else if f.tag == "select" {
+    for i, statement in f.children {
+      if truthy(func(statement)) {
+        return "true"
+      }
+    }
+    return "false"
+  } else if f.tag == "equals" {
+    if getParam(f, "a") == getParam(f, "b") {
+      return "true"
+    }
+    return "false"
+  } else if f.tag == "less" {
+    if getParamNum(f, "a") < getParamNum(f, "b") {
+      return "true"
+    }
+    return "false"
+  } else if f.tag == "more" {
+    if getParamNum(f, "a") > getParamNum(f, "b") {
+      return "true"
+    }
+    return "false"
+  } else if f.tag == "add" {
+    return std::ftoa(getParamNum(f, "a") + getParamNum(f, "b"), 5)
+  } else if f.tag == "subtract" {
+    return std::ftoa(getParamNum(f, "a") - getParamNum(f, "b"), 5)
+  } else if f.tag == "divide" {
+    return std::ftoa(getParamNum(f, "a") / getParamNum(f, "b"), 5)
+  } else if f.tag == "multiply" {
+    return std::ftoa(getParamNum(f, "a") * getParamNum(f, "b"), 5)
+  } else if f.tag == "modulo" {
+    return std::ftoa(getParamNum(f, "a") % getParamNum(f, "b"), 5)
+  } else if f.tag == "concat" {
+    return getParam(f, "a") + getParam(f, "b")
+  } else if f.tag == "not" {
+    return truthy(getParam(f, "value")) ? "false" : "true"
+  } else if f.tag == "print" {
+    printf("%s\n", getParam(f, "value"))
+    return "true"
+  } else {
+    exit(1, "Unknown function "+f.tag)
+  }
+
+  return ""
+}
+
+fn block(f: umx) {
+  for i, statement in f.children {
+    func(statement)
+  }
+}
+
+fn execute(f: umx) {
+  if f.tag != "code" {
+    exit(1, "First tag must be code")
+  }
+
+  for i, event_ in f.children {
+    event := umx(event_)
+
+    if event.tag != "event" {
+      exit(1, "Code must contain events")
+    }
+
+    if str(util::findProp(event, "on")) == "begin" {
+      block(event)
+    } else {
+      exit(1, "Unknown event")
+    }
+  }
+}
+
+fn main() {
+  execute(
+    <code>
+      <event on="begin">
+        <set-variable name="x" value=1/>
+        <while condition=<less a=<get-variable name="x"/> b=51/>>
+          <select>
+            <check condition=<not value=<modulo a=<get-variable name="x"/> b=15/>/>>
+              <print value="FizzBuzz"/>
+            </check>
+            <check condition=<not value=<modulo a=<get-variable name="x"/> b=3/>/>>
+              <print value="Fizz"/>
+            </check>
+            <check condition=<not value=<modulo a=<get-variable name="x"/> b=5/>/>>
+              <print value="Buzz"/>
+            </check>
+            <print value=<get-variable name="x"/>/>
+          </select>
+
+          <set-variable name="x" value=<add a=<get-variable name="x"/> b=1/>/>
+        </while>
+      </event>
+    </code>
+  )
+}

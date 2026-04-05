@@ -1,0 +1,147 @@
+import (
+  "std.um"
+  "util.um"
+)
+
+const (
+  TYPE_STR = 0
+  TYPE_INT = 1
+  TYPE_REAL = 2
+)
+
+type Type = enum(uint8) {
+  _null
+  _str
+  _int
+  _real
+}
+
+type SD = struct {
+  file: std::File
+  ser: bool
+}
+
+fn (this: ^SD) atom*(v: any): std::Err {
+  if this.ser {
+    switch t := type(v) {
+      case ^str:
+        typ := Type._null
+        std::fread(this.file, &typ)
+        if typ != ._str {
+          return std::error(1, "Expected string")
+        }
+        l := uint32(0)
+        std::fread(this.file, &l)
+        bytes := make([]char, l)
+        std::fread(this.file, bytes)
+        t ^= str(bytes)
+      case ^real:
+        typ := Type._null
+        std::fread(this.file, &typ)
+        if typ != ._real {
+          return std::error(1, "Expected real")
+        }
+
+        std::fread(this.file, t)
+      case ^int:
+        typ := Type._null
+        std::fread(this.file, &typ)
+        if typ != ._int {
+          return std::error(1, "Expected int")
+        }
+
+        std::fread(this.file, t)
+      default:
+        return std::error(1, "Can't decode type")
+    }
+  } else {
+    switch t := type(v) {
+      case str:
+        std::fwrite(this.file, Type._str)
+        l := uint32(len(t))
+        std::fwrite(this.file, &l)
+        std::fwrite(this.file, []char(t))
+      case real:
+        std::fwrite(this.file, Type._real)
+        std::fwrite(this.file, t)
+      case int:
+        std::fwrite(this.file, Type._int)
+        std::fwrite(this.file, t)
+      default:
+        return std::error(1, "Can't encode type")
+    }
+  }
+
+  return {}
+}
+
+fn (this: ^SD) rule*(v: umx): std::Err {
+  if v.tag == "obj" {
+    for i, child in v.children {
+      var err: std::Err
+      switch t := type(child) {
+        case umx: err = this.rule(t)
+        default: err = this.atom(child)
+      }
+      if err.code != 0 {
+        return err
+      }
+    }
+  } else if v.tag == "clamp" {
+    from := real(util::findProp(v, "min"))
+    to := real(util::findProp(v, "max"))
+    if len(v.children) != 1 {
+      return std::error(1, "<clamp> must have exactly one child")
+    }
+
+    child := ^real(v.children[0])
+    if child == null {
+      return std::error(1, "<clamp> child must be real")
+    }
+
+    err := this.atom(child)
+    if err.code != 0 {
+      return err 
+    }
+
+    child ^= child^ < from ? from : (child^ > to ? to : child^)
+  } else {
+    return std::error(1, "Invalid schema")
+  }
+  
+  return {}
+}
+
+fn deser*(path: str, obj: umx): std::Err {
+  f, err := std::fopen(path, "wb")
+  if err.code != 0 {
+    return err
+  }
+
+  serde := SD {
+    file: f,
+    ser: false
+  }
+
+  err = serde.rule(obj)
+  std::fclose(f)
+
+  return err
+}
+
+fn ser*(path: str, obj: umx): std::Err {
+  f, err := std::fopen(path, "rb")
+  if err.code != 0 {
+    return err
+  }
+
+  serde := SD {
+    file: f,
+    ser: true
+  }
+
+  err = serde.rule(obj)
+  std::fclose(f)
+  
+  return err
+}

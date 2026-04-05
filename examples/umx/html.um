@@ -1,0 +1,99 @@
+import "fnc.um"
+
+fn stringify(obj: any): str {
+  if text := ^str(obj); text != null {
+    return text^
+  } 
+
+  return sprintf("%v", obj)
+}
+
+fn htmlRec(tag: any): str {
+  if el := ^umx(tag); el != null {
+    text := sprintf("<%s ", el.tag)
+    for i, prop in el.props {
+      text += sprintf("%s=\"%s\"", prop.key, stringify(prop.value))
+    }
+
+    if len(el.children) == 0 {
+      text += "/>"
+    } else {
+      text += ">"
+      for i, child in el.children {
+        text += htmlRec(child)
+      }
+      text += sprintf("</%s>", el.tag)
+    }
+    return text
+  } else if sub := ^[]any(tag); sub != null {
+    text := ""
+    for i, item in sub {
+      text += htmlRec(item)
+    }
+    return text
+  }
+
+  return stringify(tag)
+}
+
+fn html(tag: any): str {
+  return "<!DOCTYPE html>"+htmlRec(tag)
+}
+
+fn main() {
+  navItems := []str{
+    "INTERNET ARCHIVE",
+    "WEB",
+    "TEXTS",
+    "VIDEO",
+    "AUDIO",
+    "SOFTWARE",
+    "IMAGES"
+  }
+
+  generated := ""
+  for i:=0; i<100; i++ {
+    if i%15 == 0 {
+      generated += "FizzBuzz"
+    } else if i%5 == 0 {
+      generated += "Fizz"
+    } else if i%3 == 0 {
+      generated += "Buzz"
+    } else {
+      generated += sprintf("%v", i)
+    }
+    generated += "\n"
+  }
+
+  printf("%s\n", html(
+    <html>
+      <head>
+        <title>The internet archive</title>
+        <style>{`
+          body {
+            font-family: sans-serif;
+          }
+
+          nav {
+            background: navy;
+            padding: 10px;
+            display: flex;
+            color: #fff;
+            gap: 10px;
+          }
+        `}</style>
+      </head>
+      <body>
+        <nav>
+          {fnc::Array(navItems).transform({
+            return <div class="nav-item">{ str(x) }</div>
+          })}
+        </nav>
+        <!-- boohoo -->
+        Lorem ipsum dolor sit amet.
+        <pre>{generated}</pre>
+      </body>
+      <Sample:Object/>
+    </html>
+  ))
+}

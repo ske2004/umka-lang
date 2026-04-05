@@ -195,7 +195,8 @@ typedef struct
         *fiberType,
         *ptrVoidType, *ptrNullType,
         *anyType,
-        *fileType;
+        *fileType,
+        *umxType, *umxPropType;
 } PredeclaredTypes;
 
 
