@@ -306,13 +306,13 @@ static void lexSpacesAndComments(Lexer *lex)
 }
 
 
-static void lexKeywordOrIdent(Lexer *lex)
+static void lexKeywordOrIdent(Lexer *lex, int len)
 {
     lex->tok.kind = TOK_NONE;
     unsigned char ch = lex->buf[lex->bufPos];
-    int len = 0;
 
-    do
+    while ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+           (ch >= '0' && ch <= '9') ||  ch == '_' || (lex->mode == MODE_UMX_TAG && (ch == '-' || ch == '\\' || ch == ':')))
     {
         lex->tok.name[len++] = ch;
         ch = lexChar(lex);
@@ -323,8 +323,7 @@ static void lexKeywordOrIdent(Lexer *lex)
             lex->tok.kind = TOK_NONE;
             return;
         }
-    } while (((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
-              (ch >= '0' && ch <= '9') ||  ch == '_' || (lex->mode == MODE_UMX_TAG && (ch == '-' || ch == '\\' || ch == ':')) ));
+    }
 
     lex->tok.name[len] = 0;
 
@@ -340,6 +339,16 @@ static void lexKeywordOrIdent(Lexer *lex)
 
     if (lex->tok.kind == TOK_NONE)
         lex->tok.kind = TOK_IDENT;
+}
+
+
+void lexContinueParsingUmxIdent(Lexer *lex)
+{
+    if (lex->mode == MODE_UMX_TAG && lex->tok.kind == TOK_IDENT)
+    {
+        unsigned char ch = lex->buf[lex->bufPos];
+        lexKeywordOrIdent(lex, strlen(lex->tok.name));
+    }
 }
 
 
@@ -1059,7 +1068,7 @@ static void lexNextWithEOLN(Lexer *lex)
 
     const unsigned char ch = lex->buf[lex->bufPos];
     if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_')
-        lexKeywordOrIdent(lex);
+        lexKeywordOrIdent(lex, 0);
     else if ((ch >= '0' && ch <= '9') || ch == '.')
         lexNumber(lex);
     else if (ch == '\'')

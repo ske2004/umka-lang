@@ -354,4 +354,3 @@ void rtltrace(UmkaStackSlot *params, UmkaStackSlot *result)
     else
         umkaGetResult(params, result)->intVal = -1;
 }
-

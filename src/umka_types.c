@@ -101,21 +101,35 @@ static void typeInitPredeclared(Types *types, const Blocks *blocks)
     // umx
     Type *umxType = typeAdd(types, blocks, TYPE_STRUCT);
 
-    Type *umxPropType = typeAdd(types, blocks, TYPE_STRUCT);
-    typeAddField(types, umxPropType, types->predecl.strType, "key");
-    typeAddField(types, umxPropType, types->predecl.anyType, "value");
-
     Type *umxChildrenArrayType = typeAdd(types, blocks, TYPE_DYNARRAY);
     umxChildrenArrayType->base = types->predecl.anyType;
     
-    Type *umxPropArrayType = typeAdd(types, blocks, TYPE_DYNARRAY);
-    umxPropArrayType->base = umxPropType;
+    Type *umxPropsType = typeAdd(types, blocks, TYPE_MAP);
+    const Type *keyType = types->predecl.strType;
+    const Type *valueType = types->predecl.anyType;
+    
+    const Type *ptrKeyType = typeAddPtrTo(types, blocks, keyType);
+    const Type *ptrItemType = typeAddPtrTo(types, blocks, valueType);
+    
+    // Make compatible map structure
+    Type *nodeType = typeAdd(types, blocks, TYPE_STRUCT);
+    const Type *ptrNodeType = typeAddPtrTo(types, blocks, nodeType);
+
+    typeAddField(types, nodeType, types->predecl.intType, "#len");
+    typeAddField(types, nodeType, types->predecl.intType, "#priority");
+    typeAddField(types, nodeType, ptrKeyType,             "#key");
+    typeAddField(types, nodeType, ptrItemType,            "#data");
+    typeAddField(types, nodeType, ptrNodeType,            "#left");
+    typeAddField(types, nodeType, ptrNodeType,            "#right");
+
+    typeSetBase(umxPropsType, nodeType);
+    
     typeAddField(types, umxType, types->predecl.strType, "tag");
     typeAddField(types, umxType, umxChildrenArrayType, "children");
-    typeAddField(types, umxType, umxPropArrayType, "props");
+    typeAddField(types, umxType, umxPropsType, "props");
 
     types->predecl.umxType = umxType;
-    types->predecl.umxPropType = umxPropType;
+    types->predecl.umxPropsType = umxPropsType;
 }
 
 

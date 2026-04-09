@@ -1,3 +1,4 @@
+#include "umka_api.h"
 #include "umka_gen.h"
 #include "umka_lexer.h"
 #include "umka_types.h"
@@ -2763,12 +2764,10 @@ void parseDesignatorList(Umka *umka, const Type **type, Const *constant, bool *i
 
 static void parseFactor(Umka *umka, const Type **type, Const *constant);
 static void parseUmx(Umka *umka, const Type **type)
-{
+{  
     const Field *tagField = typeFindField(umka->types.predecl.umxType, "tag", NULL);
-    const Field *childrenField = typeFindField(umka->types.predecl.umxType, "children", NULL);
+    const Field *childrenField = typeFindField(umka->types.predecl.umxType, "children", NULL); 
     const Field *propsField = typeFindField(umka->types.predecl.umxType, "props", NULL);
-    const Field *keyField = typeFindField(umka->types.predecl.umxPropType, "key", NULL);
-    const Field *valueField = typeFindField(umka->types.predecl.umxPropType, "value", NULL);
 
     const Ident *nodeIdent = identAllocTempVar(&umka->idents, &umka->types, &umka->modules, &umka->blocks, umka->types.predecl.umxType, false);
     doZeroVar(umka, nodeIdent);
@@ -2782,54 +2781,48 @@ static void parseUmx(Umka *umka, const Type **type)
         genPushLocalPtr(&umka->gen, nodeIdent->offset + tagField->offset);
         genPushGlobalPtr(&umka->gen, tagName);
         genAssign(&umka->gen, TYPE_STR, typeSize(&umka->types, umka->types.predecl.strType));
-
+        
         lexEat(&umka->lex, TOK_IDENT);
 
         if (umka->lex.tok.kind == TOK_IDENT)
-        {
-            Type *staticArrayType = typeAdd(&umka->types, &umka->blocks, TYPE_ARRAY);
-            staticArrayType->base = umka->types.predecl.umxPropType;
-            int itemSize = typeSize(&umka->types, staticArrayType->base);
-
+        {   
+            const Type *umxPropsType = umka->types.predecl.umxPropsType;
+            Ident *umxPropsIdent = identAllocTempVar(&umka->idents, &umka->types, &umka->modules, &umka->blocks, umxPropsType, false);
+            doZeroVar(umka, umxPropsIdent);
+            
+            doPushVarPtr(umka, umxPropsIdent);
+            genCallTypedBuiltin(&umka->gen, umxPropsType, BUILTIN_MAKE);           
+            
+            const Type *keyType = typeMapKey(umxPropsType);
+            const Type *valueType = typeMapItem(umxPropsType);
+            
             while (umka->lex.tok.kind == TOK_IDENT)
             {
-                lexEat(&umka->lex, TOK_IDENT);
+                genDup(&umka->gen);
+               
                 const char *name = umka->lex.tok.name;
-                char *str = storageAddStr(&umka->storage, strlen(name));
-                strcpy(str, name);
-
-                const Ident *paramIdent = identAllocTempVar(&umka->idents, &umka->types, &umka->modules, &umka->blocks, umka->types.predecl.umxPropType, false);
-                doZeroVar(umka, paramIdent);
-
-                genPushLocalPtr(&umka->gen, paramIdent->offset + keyField->offset);
-                genPushGlobalPtr(&umka->gen, str);
-                genAssign(&umka->gen, TYPE_STR, typeSize(&umka->types, umka->types.predecl.strType));
-
+                char *key = storageAddStr(&umka->storage, strlen(name));
+                strcpy(key, name);
+                genPushGlobalPtr(&umka->gen, key);
+                genGetMapPtr(&umka->gen, umxPropsType);
+                
+                lexEat(&umka->lex, TOK_IDENT);
                 lexEat(&umka->lex, TOK_EQ);
                 
-                genPushLocalPtr(&umka->gen, paramIdent->offset + valueField->offset);
-                const Type *ptype = NULL;
                 umka->lex.mode = MODE_NORMAL;
+                const Type *ptype = NULL;
                 parseFactor(umka, &ptype, NULL);
-                umka->lex.mode = MODE_UMX_TAG;
                 doExplicitTypeConv(umka, umka->types.predecl.anyType, &ptype, NULL);
-                genRefCntAssign(&umka->gen, ptype);
-
-                genPushLocalPtr(&umka->gen, paramIdent->offset);
-                typeResizeArray(staticArrayType, staticArrayType->numItems + 1);
+                umka->lex.mode = MODE_UMX_TAG;
+                
+                // Continue parsing the identifier in UMX tag mode
+                lexContinueParsingUmxIdent(&umka->lex);
+                
+                doTryOptimizeRefCntAssign(umka, valueType, true);
             }
-
-            const int staticArrayOffset = identAllocStack(&umka->idents, &umka->types, &umka->blocks, staticArrayType);
-            for (int i = staticArrayType->numItems - 1; i >= 0; i--)
-            {
-                genPushLocalPtr(&umka->gen, staticArrayOffset + i * itemSize);
-                genSwapAssign(&umka->gen, staticArrayType->base->kind, staticArrayType->base->size);   
-            }
-
+ 
             genPushLocalPtr(&umka->gen, nodeIdent->offset + propsField->offset);
-            genPushLocalPtr(&umka->gen, staticArrayOffset);
-            doAssertImplicitTypeConv(umka, propsField->type, (const Type **)&staticArrayType, NULL);
-            genRefCntAssign(&umka->gen, staticArrayType);
+            genSwapRefCntAssign(&umka->gen, umxPropsType);
         }
 
         if (umka->lex.tok.kind == TOK_DIV)

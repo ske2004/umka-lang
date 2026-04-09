@@ -135,6 +135,7 @@ int lexInit(Lexer *lex, Storage *storage, DebugInfo *debug, const char *fileName
 void lexFree(Lexer *lex);
 void lexNext(Lexer *lex);
 void lexNextForcedSemicolon(Lexer *lex);
+void lexContinueParsingUmxIdent(Lexer *lex);
 bool lexCheck(Lexer *lex, TokenKind kind);
 void lexEat(Lexer *lex, TokenKind kind);
 const char *lexSpelling(TokenKind kind);

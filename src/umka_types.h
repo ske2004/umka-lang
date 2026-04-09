@@ -196,7 +196,7 @@ typedef struct
         *ptrVoidType, *ptrNullType,
         *anyType,
         *fileType,
-        *umxType, *umxPropType;
+        *umxType, *umxPropsType;
 } PredeclaredTypes;
 
 

@@ -1,0 +1,3 @@
+fn main() {
+  printf("%v", <di-iv prc=2 asdf:asd=3></di-iv>)
+}

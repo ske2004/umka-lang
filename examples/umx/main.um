@@ -1,20 +1,10 @@
 import ("window.um"; "canvas.um"; "th.um"; "coll.um"; "input.um")
 
-fn findProp(node: umx, name: str): any {
-  for i, prop in node.props {
-    if prop.key == name {
-      return prop.value
-    }
-  }
-
-  return null
-}
-
 fn ui*(object: any, p: th::Vf2 = {}): th::Vf2 {
   if nodePtr := ^umx(object); nodePtr != null {
     node := nodePtr^
     if node.tag == "row" {
-      gap := ^real(findProp(node, "gap"))
+      gap := ^real(node.props["gap"])
       x := 0.0
       my := 0.0
 
@@ -29,7 +19,7 @@ fn ui*(object: any, p: th::Vf2 = {}): th::Vf2 {
 
       return {x, my}
     } else if node.tag == "col" {
-      gap := ^real(findProp(node, "gap"))
+      gap := ^real(node.props["gap"])
       y := 0.0
       mx := 0.0
 
@@ -44,8 +34,8 @@ fn ui*(object: any, p: th::Vf2 = {}): th::Vf2 {
 
       return {mx, y}
     } else if node.tag == "screen" {
-      x := real(findProp(node, "x"))
-      y := real(findProp(node, "y"))
+      x := real(node.props["x"])
+      y := real(node.props["y"])
 
       for i, child in node.children {
         ui(child, {p.x+x, p.y+y})
@@ -56,7 +46,7 @@ fn ui*(object: any, p: th::Vf2 = {}): th::Vf2 {
       node.tag = "row"
       size := ui(node, {p.x, p.y})
 
-      onclick := fn()(findProp(node, "onclick"))
+      onclick := fn()(node.props["onclick"])
       if coll::vf2ToRect(input::getMousePos(), {p.x, p.y, size.x+10, size.y+10}) {
         canvas::drawRect(0xEEEEEEFF, {p.x, p.y, size.x+10, size.y+10})
         if input::isJustPressed(.mouse1) {

@@ -11,8 +11,8 @@ fn stringify(obj: any): str {
 fn htmlRec(tag: any): str {
   if el := ^umx(tag); el != null {
     text := sprintf("<%s ", el.tag)
-    for i, prop in el.props {
-      text += sprintf("%s=\"%s\"", prop.key, stringify(prop.value))
+    for key, val in el.props {
+      text += sprintf("%s=\"%s\"", key, stringify(val))
     }
 
     if len(el.children) == 0 {

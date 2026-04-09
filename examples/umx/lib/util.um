@@ -1,9 +1,3 @@
 fn findProp*(node: umx, name: str): any {
-  for i, prop in node.props {
-    if prop.key == name {
-      return prop.value
-    }
-  }
-
-  return null
+  return node.props[name]
 }
